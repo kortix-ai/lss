@@ -40,7 +40,7 @@ if KB_ENV in ("dev", "test"):
 # Shared config
 KB_DIR = Path(os.getenv("KB_DIR", "~/knowledge-base")).expanduser()
 KB_DB = KB_DIR / "knbase.db"
-SUPPORTED_EXTS = {".txt", ".md", ".json", ".jsonl"}
+# Remove SUPPORTED_EXTS - we now detect text files by content
 
 # Version key source of truth
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "text-embedding-3-small")

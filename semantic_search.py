@@ -22,29 +22,137 @@ JACCARD_THRESHOLD = float(os.getenv("JACCARD_THRESHOLD", 0.83))
 RRF_K = int(os.getenv("RRF_K", 60))
 
 # Find PRF expansion terms from top docs with original stopwords
-STOP = {
-    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 
-    'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 
-    'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 
-    'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are', 
-    'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 
-    'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 
-    'while', 'of', 'at', 'by', 'for', 'with', 'through', 'during', 'before', 'after', 
-    'above', 'below', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 
-    'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 
-    'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 
-    'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 
-    'just', 'should', 'now'
-}
+# REMOVED: Hardcoded STOP set - now using DF-based filtering
 
 # Tokenizer function from search_module.py
 tok = lambda s: re.findall(r"[a-z0-9]+", (s or "").lower())
 
-def _keywords(q, max_terms=16):  # ENHANCED: Like ace code
+def _get_document_frequency_batch(terms, con):
+    """Get document frequency for multiple terms in single query"""
+    if not terms:
+        return {}
+    
+    # Check hot-stop set first (tokens known to exceed threshold)
+    result = {}
+    remaining_terms = []
+    for term in terms:
+        if term in HOT_STOP_SET:
+            result[term] = float('inf')  # Mark as high-DF
+        else:
+            cached_df = DF_CACHE.get(f"df_{term}")
+            if cached_df is not None:
+                result[term] = cached_df
+            else:
+                remaining_terms.append(term)
+    
+    if not remaining_terms:
+        return result
+    
+    try:
+        # Single IN query for all remaining terms
+        placeholders = ','.join(['?' for _ in remaining_terms])
+        rows = con.execute(f"SELECT term, doc FROM fts_vocab WHERE term IN ({placeholders})", remaining_terms).fetchall()
+        
+        # Fill results from query
+        term_df_map = {term: df for term, df in rows}
+        for term in remaining_terms:
+            df = term_df_map.get(term, 0)
+            result[term] = df
+            DF_CACHE.put(f"df_{term}", df)
+    except:
+        # Fallback to 0 for all if fts5vocab fails
+        for term in remaining_terms:
+            result[term] = 0
+            DF_CACHE.put(f"df_{term}", 0)
+    
+    return result
+
+def _get_total_docs(con):
+    """Get total document count with caching"""
+    cached_total = DF_CACHE.get("total_docs")
+    if cached_total is not None:
+        return cached_total
+    
+    try:
+        total = con.execute("SELECT COUNT(DISTINCT file_uid) FROM fts").fetchone()[0]
+        DF_CACHE.put("total_docs", total)
+        return total
+    except:
+        return 1000  # Safe fallback
+
+def _detect_phrases(q):
+    """Detect phrases from quotes and auto-extract contiguous bigrams/trigrams"""
+    phrases = []
+    
+    # Extract quoted phrases (all quote types)  
+    for pattern in [r'"([^"]+)"', r"'([^']+)'", r"'([^']+)'", r"'([^']+)'"]:
+        phrases.extend(re.findall(pattern, q))
+    
+    # Auto-extract contiguous bigrams/trigrams from query
+    words = tok(q)
+    if len(words) >= 2:
+        # Extract 2-word phrases
+        for i in range(len(words) - 1):
+            bigram = " ".join(words[i:i+2])
+            if len(bigram) > 5:  # Only meaningful bigrams
+                phrases.append(bigram)
+        # Extract 3-word phrases for longer queries
+        if len(words) >= 3:
+            for i in range(len(words) - 2):
+                trigram = " ".join(words[i:i+3]) 
+                if len(trigram) > 8:  # Only meaningful trigrams
+                    phrases.append(trigram)
+    
+    return list(set(phrases))  # dedupe
+
+def _keywords(q, max_terms=16, con=None, df_map=None):  # ENHANCED: Use pre-computed DF map
     terms = tok(q)
     nums = [t for t in terms if re.fullmatch(r"\d+(\.\d+)?", t)]
-    words = [t for t in terms if t not in nums and t not in STOP and len(t) > 2]
-    words = sorted(set(words), key=lambda x: (-len(x), x))[:max_terms]
+    
+    # Detect protected phrases
+    phrases = _detect_phrases(q)
+    phrase_tokens = set()
+    for phrase in phrases:
+        phrase_tokens.update(tok(phrase))
+    
+    # Short-query fast path: ≤6 content tokens or contains quotes -> skip DF gating
+    content_terms = [t for t in terms if t not in nums and len(t) > 2]
+    has_quotes = '"' in q or "'" in q or "'" in q or "'" in q
+    
+    if len(content_terms) <= 6 or has_quotes:
+        # Fast path: rely on phrase protection, minimal filtering
+        words = [t for t in content_terms if len(t) > 2]
+        words = sorted(set(words), key=lambda x: (-len(x), x))[:max_terms]
+        return list(dict.fromkeys(nums + words))
+    
+    # Full DF-based filtering for longer queries
+    words = []
+    if con and df_map is not None:
+        total_docs = _get_total_docs(con)
+        df_threshold = max(total_docs * 0.15, 50)  # Lowered from 0.5 to 0.15
+        
+        for t in content_terms:
+            if t in phrase_tokens:
+                words.append(t)  # protect phrase tokens
+                continue
+                
+            # Use pre-computed DF map
+            df = df_map.get(t, 0)
+            if df == float('inf'):  # Hot-stop token
+                continue
+            if df < df_threshold:  # Keep if not too common
+                words.append(t)
+            elif df >= df_threshold:
+                HOT_STOP_SET.add(t)  # Add to hot-stop set for future queries
+    else:
+        # Fallback to length filtering if no connection
+        words = content_terms
+    
+    # Adaptive max_terms based on query length
+    adaptive_max = 12 if len(content_terms) <= 12 else max_terms
+    
+    # Sort by IDF estimate (length is rough proxy when no DF available)
+    words = sorted(set(words), key=lambda x: (-len(x), x))[:adaptive_max]
     return list(dict.fromkeys(nums + words))
 
 def _fts_or(keys):
@@ -79,30 +187,6 @@ def _build_fts_with_phrases(keys, phrases):
         return f"({base_query}) OR ({phrase_query})" if base_query else phrase_query
     
     return base_query
-
-def _detect_phrases(q):
-    """Detect phrases from quotes and obvious bigrams"""
-    phrases = []
-    
-    # Extract quoted phrases (all quote types)  
-    for pattern in [r'"([^"]+)"', r"'([^']+)'", r"'([^']+)'", r"'([^']+)'"]:
-        phrases.extend(re.findall(pattern, q))
-    
-    # GENERIC: Detect common bigrams from query itself (no hardcoding)
-    words = tok(q)
-    if len(words) >= 2:
-        # Extract potential 2-word and 3-word phrases from query
-        for i in range(len(words) - 1):
-            bigram = " ".join(words[i:i+2])
-            if len(bigram) > 6:  # Only meaningful bigrams
-                phrases.append(bigram)
-        if len(words) >= 3:
-            for i in range(len(words) - 2):
-                trigram = " ".join(words[i:i+3]) 
-                if len(trigram) > 10:  # Only meaningful trigrams
-                    phrases.append(trigram)
-    
-    return list(set(phrases))  # dedupe
 
 def _snippet(text, query, max_chars=280):  # FAST: Like search_module
     sents = re.split(r'(?<=[.!?])\s+', text)
@@ -143,6 +227,8 @@ class LRU:
 
 OAI_Q_CACHE = LRU(512, ttl=900)  
 OAI_D_CACHE = LRU(8192, ttl=3600)  
+DF_CACHE = LRU(8192, ttl=21600)  # Cache DF lookups for 6 hours
+HOT_STOP_SET = set()  # In-memory set of tokens that exceed DF threshold  
 
 def _text_hash(text):
     return hashlib.md5(text.encode('utf-8')).digest()  # Binary to match kb_store
@@ -157,6 +243,10 @@ def _get_db_connection(db_path=None):
         db_path = kb_store.get_db_path()
     con = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     con.execute("PRAGMA busy_timeout=30000")
+    # Performance pragmas for faster fts5vocab scans
+    con.execute("PRAGMA cache_size=-256")  # 256MB cache
+    con.execute("PRAGMA mmap_size=268435456")  # 256MB mmap
+    con.execute("PRAGMA temp_store=MEMORY")
     return con
 
 def _cli():
@@ -232,11 +322,19 @@ def _adaptive_budget(scores, default=80):
     if r1 - r10 > 0.5: return 80
     return 90
 
-def _should_prf(query, scores):
-    """HARD-GATED PRF: only if S1 is flat OR query ≤4 tokens"""
-    tokens = [t for t in tok(query) if t not in STOP and len(t) > 2]
-    if len(tokens) <= 4: 
-        return True  # short query needs expansion
+def _should_prf(query, scores, content_tokens=None):
+    """HARD-GATED PRF: only if S1 is flat OR query has ≤4 content tokens after DF-gating"""
+    if content_tokens:
+        # Use pre-computed content tokens
+        content_words = [t for t in content_tokens if not re.fullmatch(r"\d+(\.\d+)?", t)]
+        if len(content_words) <= 4: 
+            return True  # short content query needs expansion
+    else:
+        # Fallback to length-based filtering
+        tokens = [t for t in tok(query) if len(t) > 2]
+        if len(tokens) <= 4: 
+            return True
+    
     if len(scores) < 10: 
         return False
     
@@ -247,9 +345,10 @@ def _should_prf(query, scores):
         
     return False  # Don't expand otherwise
 
-def _extract_prf_terms(docs, query_tokens):
-    """Extract expansion terms using RM3-style relevance modeling"""
+def _extract_prf_terms(docs, query_tokens, total_docs=None, df_threshold=None):
+    """Extract expansion terms using RM3-style relevance modeling with DF-based filtering"""
     term_scores = {}
+    
     for doc_id, text, score in docs[:PRF_K]:
         doc_weight = 1.0 / (1.0 + abs(score)) if score < 0 else score
         doc_tokens = tok(text)
@@ -257,12 +356,24 @@ def _extract_prf_terms(docs, query_tokens):
         for t in doc_tokens:
             tf_map[t] = tf_map.get(t, 0) + 1
         for term, tf in tf_map.items():
-            if (len(term) < 3 or term in STOP or 
-                re.fullmatch(r"\d+", term) or term in query_tokens):
+            # Basic filtering
+            if len(term) < 3 or re.fullmatch(r"\d+", term) or term in query_tokens:
                 continue
+            
+            # Hot-stop check
+            if term in HOT_STOP_SET:
+                continue
+            
+            # Use passed DF threshold if available
+            if df_threshold and total_docs:
+                # We'd need DF lookup here, but for PRF we can be more lenient
+                # Skip only the most obvious hot-stops
+                pass
+            
             idf_est = 2.0 if tf <= 2 else 1.5 if tf <= 5 else 1.0
             term_score = doc_weight * tf * idf_est
             term_scores[term] = term_scores.get(term, 0) + term_score
+    
     sorted_terms = sorted(term_scores.items(), key=lambda x: -x[1])
     expansion_terms = [t for t, s in sorted_terms[:PRF_M] if s > 0.1]
     return expansion_terms[:PRF_M]
@@ -373,8 +484,8 @@ def _jaccard_dedup(texts, scores, threshold=JACCARD_THRESHOLD):
     return keep
 
 def _compute_boost_features(texts, query):
-    """ENHANCED: Compute boost features for post-fusion enhancement (ace code)"""
-    qt = [t for t in tok(query) if t not in STOP]
+    """ENHANCED: Compute boost features for post-fusion enhancement (no stopword filtering)"""
+    qt = [t for t in tok(query) if len(t) > 2]  # Use length filter instead of STOP
     qs = set(qt)
     qnums = set(re.findall(r'\d+', ' '.join(qt)))
     phrases = {' '.join(qt[i:i+n]) for n in (2, 3) for i in range(len(qt)-n+1)} or {''}
@@ -418,9 +529,16 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
     t_all = time.time()
     version = kb_store.VERSION_KEY
     
-    # S1: BM25 with file_uid filter (simplified - no phrase detection)
+    # COMPUTE ONCE: Tokenize and get DF map for all candidate terms
+    all_terms = tok(q)
+    content_terms = [t for t in all_terms if len(t) > 2 and not re.fullmatch(r"\d+(\.\d+)?", t)]
+    
+    # Batch DF lookup for all candidate terms
+    df_map = _get_document_frequency_batch(content_terms, cur) if content_terms else {}
+    
+    # S1: BM25 with file_uid filter (with DF-based keyword extraction)
     t0 = time.time()
-    keys = _keywords(q)
+    keys = _keywords(q, max_terms=16, con=cur, df_map=df_map)
     main_query = _fts_or(keys)
     
     rows = []
@@ -440,12 +558,14 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
     initial_docs = [(span_id, text, 1.0/(1.0+raw_score)) for span_id, text, raw_score, _ in rows]
     initial_scores = [score for _, _, score in initial_docs]
     
-    # Hard-gated PRF check
+    # Hard-gated PRF check (reuse computed content tokens)
     query_tokens = set(keys)
-    use_prf = _should_prf(q, initial_scores)
+    use_prf = _should_prf(q, initial_scores, content_tokens=keys)
     
     if use_prf:
-        expansion_terms = _extract_prf_terms(initial_docs, query_tokens)
+        total_docs = _get_total_docs(cur)
+        df_threshold = max(total_docs * 0.15, 50)  # Match _keywords threshold
+        expansion_terms = _extract_prf_terms(initial_docs, query_tokens, total_docs, df_threshold)
         if expansion_terms:
             expanded_query = _build_expanded_query(keys, expansion_terms)
             if expanded_query:
@@ -484,10 +604,10 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
         text_hashes = [text_hashes[k] for k in keep_indices]
         bnorm = [bnorm[k] for k in keep_indices]
 
-    # Skip embedding for pure numeric queries
-    nums = [t for t in tok(q) if re.fullmatch(r"\d{3,4}", t)]
-    words = [t for t in tok(q) if t not in STOP and not re.fullmatch(r"\d{3,4}", t)]
-    if len(nums) > 0 and len(words) == 0:
+    # Skip embedding for pure numeric queries (reuse computed keys)
+    nums = [t for t in keys if re.fullmatch(r"\d{3,4}", t)]
+    content_words = [t for t in keys if not re.fullmatch(r"\d{3,4}", t)]
+    if len(nums) > 0 and len(content_words) == 0:
         out = [{"file_uid": file_uid, "file_path": file_path, "chunk_id": ids[j], "score": float(bnorm[j]), 
                 "snippet": _snippet(texts[j], q), "rank_stage": "S1"} 
                for j in range(min(K_FINAL, len(ids)))]
@@ -671,7 +791,8 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
     cache_pct = round(100 * cache_hits / len(ids), 1) if ids else 0
     
     if kb_config.DEBUG:
-        print(f"LAT | docs={len(out)} | rerank={rerank_pool} | embeds={nonzero_sims}/{len(ids)} | embed_batch={len(need_texts)} | cache={cache_pct}% | vec_cov={vector_coverage:.1%} | {round((time.time()-t_all)*1000,1)}ms")
+        df_hits = len([t for t in content_terms if t not in HOT_STOP_SET])
+        print(f"LAT | docs={len(out)} | rerank={rerank_pool} | df_batch={len(content_terms)} | df_hits={df_hits} | embeds={nonzero_sims}/{len(ids)} | embed_batch={len(need_texts)} | cache={cache_pct}% | vec_cov={vector_coverage:.1%} | {round((time.time()-t_all)*1000,1)}ms")
     return out
 
 __all__ = ["semantic_search"]

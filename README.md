@@ -1,4 +1,4 @@
-# Kortix kb-fusion
+# Kortix Local Sematic Search
 
 Hybrid local semantic search (SQLite FTS5 + OpenAI embeddings). Fast, lean, agent-friendly. Apache-2.0.
 

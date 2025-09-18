@@ -2,7 +2,7 @@
 import argparse, sys, json, os, sqlite3, time
 from typing import List
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Set debug BEFORE importing other modules
 import kb_config

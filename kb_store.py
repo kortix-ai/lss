@@ -2,7 +2,7 @@ import os, time, sqlite3, hashlib, json, re
 from pathlib import Path
 from collections import OrderedDict
 
-from kb_config import KB_DIR, KB_DB, SUPPORTED_EXTS, VERSION_KEY
+from kb_config import KB_DIR, KB_DB, VERSION_KEY
 import kb_config
 
 # Fast LRU cache for file stats to avoid disk reads
@@ -123,35 +123,134 @@ def _init_db():
     con.commit()
     return con
 
+def _is_text_file(file_path):
+    """Detect if a file contains text content by analyzing its bytes"""
+    path = Path(file_path)
+    
+    # PDF files - handle separately
+    if path.suffix.lower() == '.pdf':
+        return True
+    
+    try:
+        # Read first 8192 bytes to detect text
+        with open(path, 'rb') as f:
+            chunk = f.read(8192)
+        
+        if not chunk:
+            return False
+            
+        # Check for null bytes (common in binary files)
+        if b'\0' in chunk:
+            return False
+            
+        # Try to decode as UTF-8
+        try:
+            chunk.decode('utf-8')
+            return True
+        except UnicodeDecodeError:
+            pass
+            
+        # Try other common text encodings
+        for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
+            try:
+                chunk.decode(encoding)
+                # Additional heuristic: check if it contains mostly printable chars
+                printable_ratio = sum(1 for b in chunk if 32 <= b <= 126 or b in [9, 10, 13]) / len(chunk)
+                return printable_ratio > 0.7
+            except UnicodeDecodeError:
+                continue
+                
+        return False
+    except Exception:
+        return False
+
+def _extract_pdf_text(file_path):
+    """Extract text from PDF files using PyPDF2 (lightweight, pure Python)"""
+    try:
+        import PyPDF2
+        text = ""
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+        return text.strip()
+    except ImportError:
+        raise RuntimeError("PDF support requires PyPDF2. Install with: pip install pypdf2")
+
 def _extract_text(file_path):
     """Extract text from supported file types"""
     path = Path(file_path)
     ext = path.suffix.lower()
     
-    if ext in ['.txt', '.md']:
-        return path.read_text(encoding='utf-8')
-    elif ext == '.json':
-        data = json.loads(path.read_text(encoding='utf-8'))
-        if isinstance(data, dict):
-            return " ".join(str(v) for v in data.values() if isinstance(v, (str, int, float)))
-        elif isinstance(data, list):
-            return " ".join(str(item) for item in data if isinstance(item, (str, int, float)))
+    # PDF files
+    if ext == '.pdf':
+        return _extract_pdf_text(file_path)
+    
+    # Try to read as text file
+    try:
+        text = path.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        # Try other encodings for text files
+        for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
+            try:
+                text = path.read_text(encoding=encoding)
+                break
+            except UnicodeDecodeError:
+                continue
         else:
-            return str(data)
+            raise ValueError(f"Could not decode text from {file_path}")
+    
+    # Special handling for structured formats
+    if ext == '.json':
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return " ".join(str(v) for v in data.values() if isinstance(v, (str, int, float)))
+            elif isinstance(data, list):
+                return " ".join(str(item) for item in data if isinstance(item, (str, int, float)))
+            else:
+                return str(data)
+        except json.JSONDecodeError:
+            # If JSON parsing fails, treat as plain text
+            pass
     elif ext == '.jsonl':
-        texts = []
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                obj = json.loads(line.strip())
+        try:
+            texts = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
                 if 'text' in obj:
                     texts.append(obj['text'])
                 elif 'title' in obj and 'text' in obj:
                     texts.append(f"{obj['title']} {obj['text']}")
                 else:
                     texts.append(" ".join(str(v) for v in obj.values() if isinstance(v, (str, int, float))))
-        return "\n".join(texts)
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
+            return "\n".join(texts)
+        except json.JSONDecodeError:
+            # If JSONL parsing fails, treat as plain text
+            pass
+    
+    # For CSV files, include column headers and data
+    if ext == '.csv':
+        try:
+            import csv
+            import io
+            csvfile = io.StringIO(text)
+            reader = csv.reader(csvfile)
+            rows = list(reader)
+            if rows:
+                # Include headers and sample of data
+                result = " ".join(rows[0])  # Headers
+                for row in rows[1:min(100, len(rows))]:  # First 100 rows
+                    result += " " + " ".join(row)
+                return result
+        except Exception:
+            # If CSV parsing fails, treat as plain text
+            pass
+    
+    return text
 
 def _normalize_text(text):
     """Normalize text"""
@@ -191,12 +290,13 @@ def ensure_indexed(file_path, force_reindex=False):
     """Ensure file is indexed - main API with fast path"""
     path = Path(file_path).resolve()
     
-    # Check extension
-    if path.suffix.lower() not in SUPPORTED_EXTS:
-        raise ValueError(f"Unsupported extension: {path.suffix}")
-    
+    # Check if file exists
     if not path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
+    
+    # Check if it's a text file (including PDF)
+    if not _is_text_file(path):
+        raise ValueError(f"Not a text file: {path.name}")
     
     # FAST PATH: check if already indexed without expensive operations
     if not force_reindex:
@@ -308,9 +408,11 @@ def ingest_many(paths_or_dir):
     if isinstance(paths_or_dir, (str, Path)):
         path = Path(paths_or_dir)
         if path.is_dir():
+            # Recursively find all files and filter by content
             paths = []
-            for ext in SUPPORTED_EXTS:
-                paths.extend(path.rglob(f"*{ext}"))
+            for file_path in path.rglob("*"):
+                if file_path.is_file() and _is_text_file(file_path):
+                    paths.append(file_path)
         else:
             paths = [path]
     else:
