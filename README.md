@@ -33,7 +33,7 @@ uv run -m kb_fusion db-path
 ## Install
 
 ```bash
-# Download and install (macos exampe)
+# Download and install (macos example)
 sudo curl -L https://github.com/kortix-ai/kb-fusion/releases/download/v0.1.1/kb-macos-arm64 \
   -o /usr/local/bin/kb
 sudo chmod +x /usr/local/bin/kb
