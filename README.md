@@ -1,5 +1,7 @@
 # Kortix Local Sematic Search
 
+![Quick Demo](assets/quick-demo.gif)
+
 Hybrid local semantic search (SQLite FTS5 + OpenAI embeddings). Fast, lean, agent-friendly. Apache-2.0.
 
 ## Quick start (CLI)
@@ -27,6 +29,26 @@ uv run -m kb_fusion sweep --clear-embeddings 14
 uv run -m kb_fusion sweep --clear-all
 uv run -m kb_fusion db-path
 ````
+
+## Install
+
+```bash
+# Download and install (macos exampe)
+sudo curl -L https://github.com/kortix-ai/kb-fusion/releases/download/v0.1.1/kb-macos-arm64 \
+  -o /usr/local/bin/kb
+sudo chmod +x /usr/local/bin/kb
+
+# Add to ~/.zshrc or ~/.bashrc
+export OPENAI_API_KEY="your_api_key_here"
+
+# Reload shell
+source ~/.zshrc    # or source ~/.bashrc
+
+# Example usage
+kb search docs/handbook.md "How do I reset my 2FA?" -k 5
+kb ls
+kb sweep --clear-all
+```
 
 ## Programmatic use
 
