@@ -1,4 +1,4 @@
-# Kortix Local Sematic Search
+# Kortix Local Semantic Search
 
 ![Quick Demo](assets/quick-demo.gif)
 
