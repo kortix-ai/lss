@@ -5,6 +5,26 @@ from collections import OrderedDict
 from kb_config import KB_DIR, KB_DB, VERSION_KEY
 import kb_config
 
+# Directories to exclude from indexing
+EXCLUDED_DIRS = {
+    # Version control
+    '.git', '.svn', '.hg', '.bzr',
+    # Dependencies
+    'node_modules', 'vendor', 'bower_components',
+    # Python
+    '__pycache__', '.venv', 'venv', '.env', '.tox', '.pytest_cache', '.mypy_cache',
+    # Build outputs
+    'dist', 'build', 'target', 'out', '.next', '.nuxt', '.output',
+    # IDEs
+    '.idea', '.vscode', '.vs', '.eclipse', '.settings',
+    # OS
+    '.DS_Store', 'Thumbs.db',
+    # Caches
+    '.cache', '.tmp', 'tmp', 'temp', '.temp',
+    # Other
+    'coverage', '.nyc_output', '.turbo'
+}
+
 # Fast LRU cache for file stats to avoid disk reads
 _file_cache = OrderedDict()
 _cache_limit = 512
@@ -342,6 +362,27 @@ def _do_index(path):
         if kb_config.DEBUG:
             print(f"Indexing: {path.name}")
         
+        # Clean up any old file_uid entries for this path (handles content changes)
+        old_entries = cur.execute(
+            "SELECT file_uid FROM files WHERE path = ? AND file_uid != ?",
+            (str(path), file_uid)
+        ).fetchall()
+        
+        for (old_uid,) in old_entries:
+            # Get old text hashes before deleting
+            old_hashes = cur.execute(
+                "SELECT text_hash FROM fts WHERE file_uid = ?", (old_uid,)
+            ).fetchall()
+            # Delete old FTS entries
+            cur.execute("DELETE FROM fts WHERE file_uid = ?", (old_uid,))
+            # Delete old embeddings
+            if old_hashes:
+                placeholders = ','.join(['?' for _ in old_hashes])
+                cur.execute(f"DELETE FROM embeddings WHERE text_hash IN ({placeholders})", 
+                           [h[0] for h in old_hashes])
+            # Delete old file entry
+            cur.execute("DELETE FROM files WHERE file_uid = ?", (old_uid,))
+        
         # Extract and chunk
         raw_text = _extract_text(path)
         text = _normalize_text(raw_text)
@@ -403,6 +444,22 @@ def _do_index(path):
     finally:
         con.close()
 
+def _should_exclude_path(file_path, base_path):
+    """Check if path should be excluded based on EXCLUDED_DIRS"""
+    # Get relative path from base to check all parent directories
+    try:
+        rel_path = file_path.relative_to(base_path)
+        # Check if any part of the path is in excluded dirs
+        for part in rel_path.parts:
+            if part in EXCLUDED_DIRS:
+                return True
+    except ValueError:
+        # file_path is not relative to base_path, check absolute parts
+        for part in file_path.parts:
+            if part in EXCLUDED_DIRS:
+                return True
+    return False
+
 def ingest_many(paths_or_dir):
     """Ingest multiple files or directory"""
     if isinstance(paths_or_dir, (str, Path)):
@@ -411,6 +468,9 @@ def ingest_many(paths_or_dir):
             # Recursively find all files and filter by content
             paths = []
             for file_path in path.rglob("*"):
+                # Skip excluded directories
+                if _should_exclude_path(file_path, path):
+                    continue
                 if file_path.is_file() and _is_text_file(file_path):
                     paths.append(file_path)
         else:

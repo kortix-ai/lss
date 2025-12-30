@@ -7,9 +7,6 @@ import kb_config  # ensures mode-specific env behavior is applied
 from kb_config import OPENAI_MODEL, OPENAI_DIM  # keep model/dim in sync with VERSION_KEY
 import kb_store
 
-if not os.getenv('OPENAI_API_KEY'):
-    raise ValueError("OPENAI_API_KEY not set")
-
 # CONFIG - USING WORKING VALUES FROM search_module.py 
 SPAN_WORDS = int(os.getenv("KB_SPAN_WORDS", 220)) 
 SPAN_STRIDE = int(os.getenv("KB_SPAN_STRIDE", 200)) 
@@ -252,6 +249,9 @@ def _get_db_connection(db_path=None):
 def _cli():
     global _client
     if _client is None:
+        api_key = os.getenv('OPENAI_API_KEY', '').strip()
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not set (required for search operations)")
         _client = OpenAI()
     return _client
 
@@ -424,18 +424,37 @@ def _has_factual_pattern(merged_text, query):
     return min(boost, 0.2)  # Cap boost
 
 # SEMANTIC SEARCH - Main interface
-def semantic_search(file_path, sentences, db_path="semantic_search.db"):
-    """Search for sentences in a specific file"""
+def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed_only=False):
+    """Search for sentences in a file or folder"""
+    from pathlib import Path
+    
     if not sentences:
         return []
     
-    # Ensure file is ingested using kb_store for centralized storage
-    try:
-        file_uid = kb_store.ensure_indexed(file_path)
-        # Use the centralized KB database instead of separate db
-        kb_db_path = kb_store.get_db_path()
-    except Exception as e:
-        print(f"Failed to ingest {file_path}: {e}")
+    # Determine scope type
+    path = Path(scope_path).resolve()
+    kb_db_path = kb_store.get_db_path()
+    
+    # For files, get the file_uid. For directories, pass None (we'll filter by path prefix)
+    file_uid = None
+    if path.is_file():
+        if indexed_only:
+            # Check if indexed without indexing
+            file_uid = kb_store.get_file_uid(scope_path)
+            if not file_uid:
+                # File not indexed, return empty results
+                return [[] for _ in sentences]
+        else:
+            try:
+                file_uid = kb_store.ensure_indexed(scope_path)
+            except Exception as e:
+                print(f"Failed to ingest {scope_path}: {e}")
+                return []
+    elif path.is_dir():
+        # Directory - files should already be indexed by cmd_search (or we're in indexed-only mode)
+        pass
+    else:
+        print(f"Invalid scope path: {scope_path}")
         return []
     
     con = _get_db_connection(kb_db_path)
@@ -450,7 +469,7 @@ def semantic_search(file_path, sentences, db_path="semantic_search.db"):
             unique_sentences.append(sent)
     
     for sentence in unique_sentences:
-        sentence_results = _search_single_sentence(sentence, file_uid, file_path, cur, con, kb_db_path)
+        sentence_results = _search_single_sentence(sentence, file_uid, str(path), cur, con, kb_db_path)
         results.append(sentence_results)
     
     con.close()
@@ -524,8 +543,10 @@ def _compute_rank_correlation(bm25_ranks, embed_ranks):
     correlation = 1 - (6 * sum_d_sq) / (n * (n**2 - 1))
     return correlation
 
-def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None):
+def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=None):
     """Search logic with PRF, adaptive budget, and speed optimizations"""
+    from pathlib import Path
+    
     t_all = time.time()
     version = kb_store.VERSION_KEY
     
@@ -536,17 +557,30 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
     # Batch DF lookup for all candidate terms
     df_map = _get_document_frequency_batch(content_terms, cur) if content_terms else {}
     
-    # S1: BM25 with file_uid filter (with DF-based keyword extraction)
+    # S1: BM25 with scope filter (file_uid for files, path prefix for directories)
     t0 = time.time()
     keys = _keywords(q, max_terms=16, con=cur, df_map=df_map)
     main_query = _fts_or(keys)
     
     rows = []
     if main_query:
-        rows = cur.execute(
-            "SELECT id, text, bm25(fts) AS r, text_hash FROM fts WHERE fts MATCH ? AND file_uid = ? ORDER BY r LIMIT ?",
-            (main_query, file_uid, K_SQL)
-        ).fetchall()
+        if file_uid is not None:
+            # File scope - filter by file_uid with indexed_at
+            rows = cur.execute(
+                """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, files.indexed_at 
+                   FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
+                   WHERE fts MATCH ? AND fts.file_uid = ? ORDER BY r LIMIT ?""",
+                (main_query, file_uid, K_SQL)
+            ).fetchall()
+        else:
+            # Directory scope - filter by file_path prefix with indexed_at
+            path_prefix = str(Path(scope_path).resolve()) + "/"
+            rows = cur.execute(
+                """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, fts.file_path, files.indexed_at 
+                   FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
+                   WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?) ORDER BY r LIMIT ?""",
+                (main_query, scope_path, path_prefix + "%", K_SQL)
+            ).fetchall()
     
     bm25_ms = round((time.time() - t0) * 1000, 2)
     if not rows:
@@ -554,8 +588,20 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
             print(f"LAT | S1_sql={bm25_ms}ms | 0 hits")
         return []
 
+    # Normalize rows - handle both file scope (5 cols) and dir scope (6 cols) with indexed_at
+    normalized_rows = []
+    for row in rows:
+        if len(row) == 5:
+            # File scope: id, text, r, text_hash, indexed_at
+            span_id, text, raw_score, text_hash, indexed_at = row
+            normalized_rows.append((span_id, text, raw_score, text_hash, scope_path, indexed_at))
+        else:  # len(row) == 6 (directory scope)
+            # Dir scope: id, text, r, text_hash, file_path, indexed_at
+            span_id, text, raw_score, text_hash, file_path, indexed_at = row
+            normalized_rows.append((span_id, text, raw_score, text_hash, file_path, indexed_at))
+    
     # PRF - RESTORE THIS LOGIC
-    initial_docs = [(span_id, text, 1.0/(1.0+raw_score)) for span_id, text, raw_score, _ in rows]
+    initial_docs = [(span_id, text, 1.0/(1.0+raw_score)) for span_id, text, raw_score, _, _, _ in normalized_rows]
     initial_scores = [score for _, _, score in initial_docs]
     
     # Hard-gated PRF check (reuse computed content tokens)
@@ -570,19 +616,44 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
             expanded_query = _build_expanded_query(keys, expansion_terms)
             if expanded_query:
                 t_prf = time.time()
-                prf_rows = cur.execute(
-                    "SELECT id, text, bm25(fts) AS r, text_hash FROM fts WHERE fts MATCH ? AND file_uid = ? ORDER BY r LIMIT ?",
-                    (expanded_query, file_uid, K_SQL2)
-                ).fetchall()
+                if file_uid is not None:
+                    # File scope with indexed_at
+                    prf_rows = cur.execute(
+                        """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, files.indexed_at 
+                           FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
+                           WHERE fts MATCH ? AND fts.file_uid = ? ORDER BY r LIMIT ?""",
+                        (expanded_query, file_uid, K_SQL2)
+                    ).fetchall()
+                else:
+                    # Directory scope with indexed_at
+                    path_prefix = str(Path(scope_path).resolve()) + "/"
+                    prf_rows = cur.execute(
+                        """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, fts.file_path, files.indexed_at 
+                           FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
+                           WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?) ORDER BY r LIMIT ?""",
+                        (expanded_query, scope_path, path_prefix + "%", K_SQL2)
+                    ).fetchall()
                 
                 if prf_rows:
+                    # Normalize prf_rows with indexed_at
+                    normalized_prf_rows = []
+                    for row in prf_rows:
+                        if len(row) == 5:
+                            # File scope: id, text, r, text_hash, indexed_at
+                            span_id, text, raw_score, text_hash, indexed_at = row
+                            normalized_prf_rows.append((span_id, text, raw_score, text_hash, scope_path, indexed_at))
+                        else:  # len(row) == 6
+                            # Dir scope: id, text, r, text_hash, file_path, indexed_at
+                            span_id, text, raw_score, text_hash, file_path, indexed_at = row
+                            normalized_prf_rows.append((span_id, text, raw_score, text_hash, file_path, indexed_at))
+                    
                     # Drift protection: check overlap ≥0.4
                     orig_top10 = set(doc_id for doc_id, _, _ in initial_docs[:10])
-                    prf_top10 = set(span_id for span_id, _, _, _ in prf_rows[:10])
+                    prf_top10 = set(span_id for span_id, _, _, _, _, _ in normalized_prf_rows[:10])
                     overlap = len(orig_top10 & prf_top10) / 10.0 if orig_top10 else 0.0
                     
                     if overlap >= 0.4:  # drift guard passed
-                        rows = prf_rows
+                        normalized_rows = normalized_prf_rows
                         if kb_config.DEBUG:
                             prf_ms = round((time.time() - t_prf) * 1000, 2)
                             print(f"PRF | exp_terms={len(expansion_terms)} | overlap={overlap:.2f} | {prf_ms}ms")
@@ -591,10 +662,12 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
                             print(f"PRF | DRIFT | overlap={overlap:.2f} < 0.4 | fallback")
 
     # Slice to TOP_OAI and dedupe 
-    ids = [i for i, _, _, _ in rows[:TOP_OAI]]
-    texts = [t for _, t, _, _ in rows[:TOP_OAI]]
-    text_hashes = [h for _, _, _, h in rows[:TOP_OAI]]
-    braw = [1.0/(1.0+float(r)) for _, _, r, _ in rows[:TOP_OAI]]
+    ids = [i for i, _, _, _, _, _ in normalized_rows[:TOP_OAI]]
+    texts = [t for _, t, _, _, _, _ in normalized_rows[:TOP_OAI]]
+    text_hashes = [h for _, _, _, h, _, _ in normalized_rows[:TOP_OAI]]
+    file_paths = [fp for _, _, _, _, fp, _ in normalized_rows[:TOP_OAI]]
+    indexed_ats = [ia for _, _, _, _, _, ia in normalized_rows[:TOP_OAI]]
+    braw = [1.0/(1.0+float(r)) for _, _, r, _, _, _ in normalized_rows[:TOP_OAI]]
     bnorm = _minmax(braw)
 
     if len(texts) > 1:
@@ -602,15 +675,27 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
         ids = [ids[k] for k in keep_indices]
         texts = [texts[k] for k in keep_indices]
         text_hashes = [text_hashes[k] for k in keep_indices]
+        file_paths = [file_paths[k] for k in keep_indices]
+        indexed_ats = [indexed_ats[k] for k in keep_indices]
         bnorm = [bnorm[k] for k in keep_indices]
 
     # Skip embedding for pure numeric queries (reuse computed keys)
     nums = [t for t in keys if re.fullmatch(r"\d{3,4}", t)]
     content_words = [t for t in keys if not re.fullmatch(r"\d{3,4}", t)]
     if len(nums) > 0 and len(content_words) == 0:
-        out = [{"file_uid": file_uid, "file_path": file_path, "chunk_id": ids[j], "score": float(bnorm[j]), 
-                "snippet": _snippet(texts[j], q), "rank_stage": "S1"} 
-               for j in range(min(K_FINAL, len(ids)))]
+        out = []
+        for j in range(min(K_FINAL, len(ids))):
+            # Extract file_uid from chunk_id or use file_uid if available
+            chunk_file_uid = ids[j].split("::")[0] if "::" in ids[j] else (file_uid or ids[j])
+            out.append({
+                "file_uid": chunk_file_uid,
+                "file_path": file_paths[j],
+                "chunk_id": ids[j],
+                "score": float(bnorm[j]),
+                "snippet": _snippet(texts[j], q),
+                "rank_stage": "S1",
+                "indexed_at": indexed_ats[j]
+            })
         return out
 
     # Use adaptive budget for rerank pool, but cap at available candidates
@@ -621,6 +706,7 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
     ids = ids[:rerank_pool] 
     texts = texts[:rerank_pool]
     text_hashes = text_hashes[:rerank_pool]
+    file_paths = file_paths[:rerank_pool]
 
     # S2: SINGLE OpenAI call
     t2 = time.time()
@@ -680,9 +766,18 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
                 sims_o[i] = float(dv @ qv)
     else:
         # Embedding failed, use BM25 only
-        out = [{"file_uid": file_uid, "file_path": file_path, "chunk_id": ids[j], "score": float(bnorm[j]),
-                "snippet": _snippet(texts[j], q), "rank_stage": "S1_embed_fail"} 
-               for j in range(min(K_FINAL, len(ids)))]
+        out = []
+        for j in range(min(K_FINAL, len(ids))):
+            chunk_file_uid = ids[j].split("::")[0] if "::" in ids[j] else (file_uid or ids[j])
+            out.append({
+                "file_uid": chunk_file_uid,
+                "file_path": file_paths[j],
+                "chunk_id": ids[j],
+                "score": float(bnorm[j]),
+                "snippet": _snippet(texts[j], q),
+                "rank_stage": "S1_embed_fail",
+                "indexed_at": indexed_ats[j]
+            })
         return out
     
     # RRF Fusion with ADAPTIVE embedding weight
@@ -778,13 +873,19 @@ def _search_single_sentence(q, file_uid, file_path, cur, cache_con, db_path=None
     oai_ms = round((time.time() - t2) * 1000, 2)
     out = []
     for i, (doc_id, text, final_score) in enumerate(final_docs):
+        # Find the file_path and indexed_at for this doc_id
+        doc_idx = ids.index(doc_id)
+        doc_file_path = file_paths[doc_idx]
+        doc_indexed_at = indexed_ats[doc_idx]
+        chunk_file_uid = doc_id.split("::")[0] if "::" in doc_id else (file_uid or doc_id)
         out.append({
-            "file_uid": file_uid,
-            "file_path": file_path,
+            "file_uid": chunk_file_uid,
+            "file_path": doc_file_path,
             "chunk_id": doc_id,
             "score": float(final_score), 
             "snippet": _snippet(text, q),
-            "rank_stage": "S3_MMR" if vector_coverage >= 0.90 else "S3"
+            "rank_stage": "S3_MMR" if vector_coverage >= 0.90 else "S3",
+            "indexed_at": doc_indexed_at
         })
     
     cache_hits = len(ids) - len(need_idx) if need_idx else len(ids)

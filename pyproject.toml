@@ -7,7 +7,7 @@ packages = ["."]
 
 [project]
 name = "kb-fusion"
-version = "0.1.1"
+version = "0.1.2"
 description = "Hybrid semantic search for local knowledge bases (SQLite FTS5 + embeddings)."
 authors = [{ name = "Kortix", email = "oss@kortix.so" }]
 license = { text = "Apache-2.0" }
@@ -16,7 +16,6 @@ requires-python = ">=3.9"
 dependencies = [
   "numpy>=1.24",
   "openai>=1.30.0",
-  "pandas>=2.3.2",
   "pypdf2>=3.0.0",
 ]
 
@@ -35,6 +34,11 @@ dev = [
 build = [
   "nuitka>=2.4",
   "pyinstaller>=6.6",
+]
+
+[dependency-groups]
+build = [
+    "nuitka>=2.7.14",
 ]
 
 [tool.black]

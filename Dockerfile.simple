@@ -1,0 +1,23 @@
+FROM --platform=linux/amd64 python:3.11-slim
+
+WORKDIR /build
+
+# Install uv
+RUN pip install uv
+
+# Copy project files
+COPY pyproject.toml uv.lock ./
+COPY *.py ./
+COPY README.md ./
+
+# Create output directory
+RUN mkdir -p /output
+
+# Build wheel package with uv
+RUN uv build --wheel --out-dir /output
+
+# Default command: copy output to mounted volume
+CMD cp -r /output/* /app/ && echo "Build artifacts:" && ls -lh /app/
+
+
+
