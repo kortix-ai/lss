@@ -1,5 +1,7 @@
 # LSS — Local Semantic Search
 
+![Quick Demo](assets/quick_demo.gif)
+
 Hybrid semantic search over local files. BM25 + OpenAI embeddings fused with Reciprocal Rank Fusion. Real-time file watching. Runs on any machine.
 
 ```
