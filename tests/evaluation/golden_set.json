@@ -1,0 +1,410 @@
+{
+  "version": "1.0",
+  "description": "Golden set for lss search quality evaluation — 40 queries with graded relevance against a 30-file project corpus",
+  "created": "2026-02-08",
+  "relevance_scale": {
+    "0": "not relevant",
+    "1": "somewhat relevant (mentions the topic)",
+    "2": "highly relevant (directly answers the query)"
+  },
+  "queries": [
+    {
+      "id": "q001",
+      "text": "JWT token authentication",
+      "category": "keyword",
+      "judgments": {
+        "src/auth/jwt_handler.py": 2,
+        "src/auth/middleware.py": 2,
+        "tests/test_auth.py": 1,
+        "docs/api_reference.md": 1,
+        "src/auth/oauth2_provider.py": 1
+      }
+    },
+    {
+      "id": "q002",
+      "text": "how does the authentication middleware work",
+      "category": "conceptual",
+      "judgments": {
+        "src/auth/middleware.py": 2,
+        "src/auth/jwt_handler.py": 1,
+        "src/api/routes.py": 1,
+        "docs/api_reference.md": 1
+      }
+    },
+    {
+      "id": "q003",
+      "text": "database connection pool configuration",
+      "category": "conceptual",
+      "judgments": {
+        "src/db/connection_pool.py": 2,
+        "config/database.yaml": 2,
+        "config/settings.py": 1,
+        "docs/runbook.md": 1
+      }
+    },
+    {
+      "id": "q004",
+      "text": "Kubernetes deployment rolling update",
+      "category": "keyword",
+      "judgments": {
+        "deploy/kubernetes/deployment.yaml": 2,
+        "docs/runbook.md": 1,
+        "deploy/ci/github_actions.yaml": 1,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q005",
+      "text": "how to deploy a new version of the service",
+      "category": "procedural",
+      "judgments": {
+        "docs/runbook.md": 2,
+        "deploy/ci/github_actions.yaml": 2,
+        "deploy/kubernetes/deployment.yaml": 1,
+        "docs/onboarding.md": 1
+      }
+    },
+    {
+      "id": "q006",
+      "text": "Redis cache invalidation",
+      "category": "keyword",
+      "judgments": {
+        "src/db/redis_cache.py": 2,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q007",
+      "text": "what metrics are exported for Prometheus",
+      "category": "conceptual",
+      "judgments": {
+        "src/monitoring/metrics.py": 2,
+        "src/monitoring/alerting.py": 1,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q008",
+      "text": "password hashing bcrypt",
+      "category": "keyword",
+      "judgments": {
+        "src/auth/password_hash.py": 2,
+        "tests/test_auth.py": 1
+      }
+    },
+    {
+      "id": "q009",
+      "text": "rate limiting API requests",
+      "category": "conceptual",
+      "judgments": {
+        "src/api/rate_limiter.py": 2,
+        "src/auth/middleware.py": 1,
+        "src/api/routes.py": 1,
+        "tests/test_api.py": 1
+      }
+    },
+    {
+      "id": "q010",
+      "text": "AES-256 encryption at rest",
+      "category": "keyword",
+      "judgments": {
+        "src/security/encryption.py": 2
+      }
+    },
+    {
+      "id": "q011",
+      "text": "how to run tests locally",
+      "category": "procedural",
+      "judgments": {
+        "docs/onboarding.md": 2,
+        "tests/test_auth.py": 1,
+        "tests/test_api.py": 1,
+        "deploy/ci/github_actions.yaml": 1
+      }
+    },
+    {
+      "id": "q012",
+      "text": "OAuth2 PKCE authorization code flow",
+      "category": "keyword",
+      "judgments": {
+        "src/auth/oauth2_provider.py": 2,
+        "src/auth/jwt_handler.py": 1,
+        "tests/test_auth.py": 1
+      }
+    },
+    {
+      "id": "q013",
+      "text": "database schema migrations alembic",
+      "category": "keyword",
+      "judgments": {
+        "src/db/migrations.py": 2,
+        "docs/onboarding.md": 1
+      }
+    },
+    {
+      "id": "q014",
+      "text": "how are sensitive fields encrypted in the database",
+      "category": "conceptual",
+      "judgments": {
+        "src/security/encryption.py": 2,
+        "src/security/audit_log.py": 1
+      }
+    },
+    {
+      "id": "q015",
+      "text": "WebSocket real-time notifications",
+      "category": "keyword",
+      "judgments": {
+        "src/api/websocket.py": 2,
+        "docs/architecture.md": 1,
+        "src/monitoring/metrics.py": 1
+      }
+    },
+    {
+      "id": "q016",
+      "text": "CSRF protection double submit cookie",
+      "category": "keyword",
+      "judgments": {
+        "src/security/csrf_protection.py": 2
+      }
+    },
+    {
+      "id": "q017",
+      "text": "what happens when the error rate is too high",
+      "category": "conceptual",
+      "judgments": {
+        "src/monitoring/alerting.py": 2,
+        "docs/runbook.md": 2,
+        "src/monitoring/metrics.py": 1
+      }
+    },
+    {
+      "id": "q018",
+      "text": "cursor-based pagination implementation",
+      "category": "keyword",
+      "judgments": {
+        "src/utils/pagination.py": 2,
+        "src/api/routes.py": 1,
+        "docs/api_reference.md": 1,
+        "tests/test_api.py": 1
+      }
+    },
+    {
+      "id": "q019",
+      "text": "Celery background tasks email sending",
+      "category": "keyword",
+      "judgments": {
+        "src/tasks/background_worker.py": 2,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q020",
+      "text": "Terraform AWS EKS infrastructure",
+      "category": "keyword",
+      "judgments": {
+        "deploy/terraform/main.tf": 2,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q021",
+      "text": "full text search PostgreSQL ts_vector",
+      "category": "keyword",
+      "judgments": {
+        "src/search/full_text.py": 2,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q022",
+      "text": "how to set up local development environment",
+      "category": "procedural",
+      "judgments": {
+        "docs/onboarding.md": 2,
+        "config/settings.py": 1,
+        "config/database.yaml": 1
+      }
+    },
+    {
+      "id": "q023",
+      "text": "role-based access control RBAC permissions",
+      "category": "keyword",
+      "judgments": {
+        "src/auth/middleware.py": 2,
+        "src/security/audit_log.py": 1,
+        "src/auth/jwt_handler.py": 1,
+        "tests/test_auth.py": 1
+      }
+    },
+    {
+      "id": "q024",
+      "text": "Docker multi-stage build",
+      "category": "keyword",
+      "judgments": {
+        "deploy/docker/Dockerfile": 2,
+        "deploy/ci/github_actions.yaml": 1
+      }
+    },
+    {
+      "id": "q025",
+      "text": "audit logging security events compliance",
+      "category": "keyword",
+      "judgments": {
+        "src/security/audit_log.py": 2,
+        "src/monitoring/logging_config.py": 1
+      }
+    },
+    {
+      "id": "q026",
+      "text": "how to handle database connection exhaustion",
+      "category": "procedural",
+      "judgments": {
+        "docs/runbook.md": 2,
+        "src/db/connection_pool.py": 2,
+        "src/monitoring/alerting.py": 1,
+        "config/database.yaml": 1
+      }
+    },
+    {
+      "id": "q027",
+      "text": "structured JSON logging",
+      "category": "keyword",
+      "judgments": {
+        "src/monitoring/logging_config.py": 2,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q028",
+      "text": "how are API endpoints defined and what do they do",
+      "category": "conceptual",
+      "judgments": {
+        "src/api/routes.py": 2,
+        "docs/api_reference.md": 2,
+        "tests/test_api.py": 1
+      }
+    },
+    {
+      "id": "q029",
+      "text": "SQL injection prevention parameterized queries",
+      "category": "keyword",
+      "judgments": {
+        "src/db/query_builder.py": 2
+      }
+    },
+    {
+      "id": "q030",
+      "text": "seed database test data",
+      "category": "keyword",
+      "judgments": {
+        "scripts/seed_database.py": 2,
+        "docs/onboarding.md": 1
+      }
+    },
+    {
+      "id": "q031",
+      "text": "monitoring",
+      "category": "short_vague",
+      "judgments": {
+        "src/monitoring/metrics.py": 2,
+        "src/monitoring/alerting.py": 2,
+        "src/monitoring/logging_config.py": 1,
+        "docs/architecture.md": 1,
+        "docs/runbook.md": 1
+      }
+    },
+    {
+      "id": "q032",
+      "text": "security",
+      "category": "short_vague",
+      "judgments": {
+        "src/security/encryption.py": 2,
+        "src/security/csrf_protection.py": 2,
+        "src/security/audit_log.py": 2,
+        "src/auth/password_hash.py": 1,
+        "src/auth/jwt_handler.py": 1,
+        "deploy/docker/Dockerfile": 1
+      }
+    },
+    {
+      "id": "q033",
+      "text": "how does caching work in this system",
+      "category": "conceptual",
+      "judgments": {
+        "src/db/redis_cache.py": 2,
+        "docs/architecture.md": 1
+      }
+    },
+    {
+      "id": "q034",
+      "text": "CI/CD pipeline GitHub Actions build test deploy",
+      "category": "multi_concept",
+      "judgments": {
+        "deploy/ci/github_actions.yaml": 2,
+        "docs/runbook.md": 1,
+        "docs/architecture.md": 1,
+        "deploy/kubernetes/deployment.yaml": 1
+      }
+    },
+    {
+      "id": "q035",
+      "text": "token refresh expiration",
+      "category": "keyword",
+      "judgments": {
+        "src/auth/jwt_handler.py": 2,
+        "docs/api_reference.md": 1,
+        "src/api/routes.py": 1,
+        "tests/test_auth.py": 1
+      }
+    },
+    {
+      "id": "q036",
+      "text": "pydantic settings environment variables configuration",
+      "category": "keyword",
+      "judgments": {
+        "config/settings.py": 2,
+        "config/database.yaml": 1,
+        "docs/onboarding.md": 1
+      }
+    },
+    {
+      "id": "q037",
+      "text": "what tests exist and what do they cover",
+      "category": "conceptual",
+      "judgments": {
+        "tests/test_auth.py": 2,
+        "tests/test_api.py": 2,
+        "docs/onboarding.md": 1
+      }
+    },
+    {
+      "id": "q038",
+      "text": "production SSL database read replicas",
+      "category": "multi_concept",
+      "judgments": {
+        "config/database.yaml": 2,
+        "src/db/connection_pool.py": 1,
+        "docs/runbook.md": 1
+      }
+    },
+    {
+      "id": "q039",
+      "text": "token bucket algorithm distributed rate limit",
+      "category": "keyword",
+      "judgments": {
+        "src/api/rate_limiter.py": 2
+      }
+    },
+    {
+      "id": "q040",
+      "text": "how to rollback a failed deployment",
+      "category": "procedural",
+      "judgments": {
+        "docs/runbook.md": 2,
+        "deploy/kubernetes/deployment.yaml": 1,
+        "deploy/ci/github_actions.yaml": 1
+      }
+    }
+  ]
+}

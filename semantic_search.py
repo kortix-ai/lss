@@ -1,22 +1,30 @@
-import os, re, time, sqlite3, json, numpy as np, hashlib, unicodedata
+import os, re, time, sqlite3, json, numpy as np, hashlib, unicodedata, logging
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from openai import OpenAI
 
-import kb_config  # ensures mode-specific env behavior is applied
-from kb_config import OPENAI_MODEL, OPENAI_DIM  # keep model/dim in sync with VERSION_KEY
-import kb_store
+log = logging.getLogger("lss.search")
+
+import lss_config  # ensures mode-specific env behavior is applied
+from lss_config import OPENAI_MODEL, OPENAI_DIM  # keep model/dim in sync with VERSION_KEY
+import lss_store
 
 # CONFIG - USING WORKING VALUES FROM search_module.py 
-SPAN_WORDS = int(os.getenv("KB_SPAN_WORDS", 220)) 
-SPAN_STRIDE = int(os.getenv("KB_SPAN_STRIDE", 200)) 
-SENT_WORDS = int(os.getenv("KB_SENT_WORDS", 60)) 
-K_SQL = int(os.getenv("KB_K_SQL", 600)) 
-K_FINAL = int(os.getenv("KB_K_FINAL", 20))
-TOP_OAI = int(os.getenv("KB_TOP_OAI", 28))
+SPAN_WORDS = int(os.getenv("LSS_SPAN_WORDS", 220)) 
+SPAN_STRIDE = int(os.getenv("LSS_SPAN_STRIDE", 200)) 
+SENT_WORDS = int(os.getenv("LSS_SENT_WORDS", 60)) 
+K_SQL = int(os.getenv("LSS_K_SQL", 600)) 
+K_FINAL = int(os.getenv("LSS_K_FINAL", 20))
+TOP_OAI = int(os.getenv("LSS_TOP_OAI", 28))
 OAI_TIMEOUT = float(os.getenv("OAI_TIMEOUT", 2.0))
 JACCARD_THRESHOLD = float(os.getenv("JACCARD_THRESHOLD", 0.83))
 RRF_K = int(os.getenv("RRF_K", 60))
+
+# BM25 tuning parameters — FTS5's built-in bm25() uses hardcoded k1=1.2, b=0.75
+# which produces extremely flat scores on short passages (e.g. BEIR biomedical).
+# Our custom BM25 re-scorer uses the same defaults as Lucene/Anserini.
+BM25_K1 = float(os.getenv("BM25_K1", 1.2))
+BM25_B = float(os.getenv("BM25_B", 0.75))
 
 # Find PRF expansion terms from top docs with original stopwords
 # REMOVED: Hardcoded STOP set - now using DF-based filtering
@@ -77,12 +85,102 @@ def _get_total_docs(con):
     except:
         return 1000  # Safe fallback
 
+def _get_avg_doc_length(con):
+    """Get average document length (in tokens) with caching.
+    
+    Uses fts_vocab aggregate + total row count to compute avg tokens per row.
+    Falls back to a sensible default (SPAN_WORDS) if data is unavailable.
+    """
+    cached = DF_CACHE.get("avg_dl")
+    if cached is not None:
+        return cached
+
+    try:
+        # Total tokens across all rows (sum of all term occurrences)
+        total_tokens = con.execute(
+            "SELECT SUM(cnt) FROM fts_vocab"
+        ).fetchone()[0]
+        total_rows = con.execute(
+            "SELECT COUNT(DISTINCT file_uid) FROM fts"
+        ).fetchone()[0]
+
+        if total_rows and total_rows > 0 and total_tokens:
+            avg_dl = total_tokens / total_rows
+        else:
+            avg_dl = float(SPAN_WORDS)  # fallback
+
+        DF_CACHE.put("avg_dl", avg_dl)
+        return avg_dl
+    except Exception:
+        return float(SPAN_WORDS)
+
+
+def _custom_bm25_rescore(query_terms, texts, ids, con,
+                         k1=None, b=None):
+    """Re-score FTS5 candidate rows with proper BM25 (tunable k1/b).
+
+    FTS5's built-in bm25() produces flat scores on short passages because it
+    uses a single-value phrase frequency without proper TF saturation or
+    document-length normalization relative to corpus averages.
+
+    This function:
+    1. Uses the FTS5 candidate set (already filtered by MATCH) as input
+    2. Tokenizes each chunk text to compute raw TF per query term
+    3. Applies standard BM25 formula with configurable k1 and b
+    4. Uses corpus statistics (N, DF, avgDL) from fts_vocab
+
+    Returns {chunk_id: bm25_score} dict with POSITIVE scores (higher = better).
+    """
+    if k1 is None:
+        k1 = BM25_K1
+    if b is None:
+        b = BM25_B
+
+    N = _get_total_docs(con)
+    avg_dl = _get_avg_doc_length(con)
+
+    # Batch DF lookup for all query terms
+    df_map = _get_document_frequency_batch(query_terms, con)
+
+    scores = {}
+    for idx, (chunk_id, text) in enumerate(zip(ids, texts)):
+        doc_tokens = tok(text)
+        dl = len(doc_tokens)
+
+        # Build TF map for this document
+        tf_map = {}
+        for t in doc_tokens:
+            tf_map[t] = tf_map.get(t, 0) + 1
+
+        score = 0.0
+        for term in query_terms:
+            tf = tf_map.get(term, 0)
+            if tf == 0:
+                continue
+
+            df = df_map.get(term, 0)
+            if df == float('inf'):
+                df = N  # hot-stop term, IDF ≈ 0
+
+            # IDF: log(1 + (N - df + 0.5) / (df + 0.5))
+            idf = np.log(1.0 + (N - df + 0.5) / (df + 0.5))
+
+            # TF saturation: tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avg_dl))
+            tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1.0 - b + b * dl / avg_dl))
+
+            score += idf * tf_norm
+
+        scores[chunk_id] = score
+
+    return scores
+
+
 def _detect_phrases(q):
     """Detect phrases from quotes and auto-extract contiguous bigrams/trigrams"""
     phrases = []
     
     # Extract quoted phrases (all quote types)  
-    for pattern in [r'"([^"]+)"', r"'([^']+)'", r"'([^']+)'", r"'([^']+)'"]:
+    for pattern in [r'"([^"]+)"', r"'([^']+)'", r"\u2018([^\\u2019]+)\u2019", r"\u201c([^\u201d]+)\u201d"]:
         phrases.extend(re.findall(pattern, q))
     
     # Auto-extract contiguous bigrams/trigrams from query
@@ -114,7 +212,7 @@ def _keywords(q, max_terms=16, con=None, df_map=None):  # ENHANCED: Use pre-comp
     
     # Short-query fast path: ≤6 content tokens or contains quotes -> skip DF gating
     content_terms = [t for t in terms if t not in nums and len(t) > 2]
-    has_quotes = '"' in q or "'" in q or "'" in q or "'" in q
+    has_quotes = '"' in q or "'" in q or "\u2018" in q or "\u2019" in q
     
     if len(content_terms) <= 6 or has_quotes:
         # Fast path: rely on phrase protection, minimal filtering
@@ -187,12 +285,12 @@ def _build_fts_with_phrases(keys, phrases):
 
 def _snippet(text, query, max_chars=280):  # FAST: Like search_module
     sents = re.split(r'(?<=[.!?])\s+', text)
-    if not sents: return (text[:max_chars] + ("…" if len(text) > max_chars else ""))
+    if not sents: return (text[:max_chars] + ("\u2026" if len(text) > max_chars else ""))
     qt = set(tok(query))
     best = max(range(len(sents)), key=lambda i: sum(w in sents[i].lower() for w in qt))
     left, right = max(0, best-1), min(len(sents), best+3)
     out = " ".join(sents[left:right])
-    return (out[:max_chars].rsplit(" ", 1)[0] + "…") if len(out) > max_chars else out
+    return (out[:max_chars].rsplit(" ", 1)[0] + "\u2026") if len(out) > max_chars else out
 
 def _minmax(xs):
     if xs is None or len(xs) == 0: 
@@ -228,7 +326,7 @@ DF_CACHE = LRU(8192, ttl=21600)  # Cache DF lookups for 6 hours
 HOT_STOP_SET = set()  # In-memory set of tokens that exceed DF threshold  
 
 def _text_hash(text):
-    return hashlib.md5(text.encode('utf-8')).digest()  # Binary to match kb_store
+    return hashlib.md5(text.encode('utf-8')).digest()  # Binary to match lss_store
 
 
 
@@ -237,7 +335,7 @@ _client = None
 
 def _get_db_connection(db_path=None):
     if db_path is None:
-        db_path = kb_store.get_db_path()
+        db_path = lss_store.get_db_path()
     con = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     con.execute("PRAGMA busy_timeout=30000")
     # Performance pragmas for faster fts5vocab scans
@@ -433,20 +531,20 @@ def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed
     
     # Determine scope type
     path = Path(scope_path).resolve()
-    kb_db_path = kb_store.get_db_path()
+    lss_db_path = lss_store.get_db_path()
     
     # For files, get the file_uid. For directories, pass None (we'll filter by path prefix)
     file_uid = None
     if path.is_file():
         if indexed_only:
             # Check if indexed without indexing
-            file_uid = kb_store.get_file_uid(scope_path)
+            file_uid = lss_store.get_file_uid(scope_path)
             if not file_uid:
                 # File not indexed, return empty results
                 return [[] for _ in sentences]
         else:
             try:
-                file_uid = kb_store.ensure_indexed(scope_path)
+                file_uid = lss_store.ensure_indexed(scope_path)
             except Exception as e:
                 print(f"Failed to ingest {scope_path}: {e}")
                 return []
@@ -457,7 +555,13 @@ def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed
         print(f"Invalid scope path: {scope_path}")
         return []
     
-    con = _get_db_connection(kb_db_path)
+    # Use lss_store._init_db() to ensure schema exists (handles empty/new DBs),
+    # then disable auto-checkpointing on the search connection.  Search is
+    # primarily a reader; the only writes are best-effort embedding cache
+    # inserts.  Letting the search connection trigger a checkpoint can block
+    # concurrent writers (lss-sync) and vice versa.
+    con = lss_store._init_db()
+    con.execute("PRAGMA wal_autocheckpoint=0")  # never auto-checkpoint from search
     cur = con.cursor()
     
     results = []
@@ -469,7 +573,7 @@ def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed
             unique_sentences.append(sent)
     
     for sentence in unique_sentences:
-        sentence_results = _search_single_sentence(sentence, file_uid, str(path), cur, con, kb_db_path)
+        sentence_results = _search_single_sentence(sentence, file_uid, str(path), cur, con, lss_db_path)
         results.append(sentence_results)
     
     con.close()
@@ -548,7 +652,7 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     from pathlib import Path
     
     t_all = time.time()
-    version = kb_store.VERSION_KEY
+    version = lss_store.VERSION_KEY
     
     # COMPUTE ONCE: Tokenize and get DF map for all candidate terms
     all_terms = tok(q)
@@ -584,7 +688,7 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     
     bm25_ms = round((time.time() - t0) * 1000, 2)
     if not rows:
-        if kb_config.DEBUG:
+        if lss_config.DEBUG:
             print(f"LAT | S1_sql={bm25_ms}ms | 0 hits")
         return []
 
@@ -654,11 +758,11 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
                     
                     if overlap >= 0.4:  # drift guard passed
                         normalized_rows = normalized_prf_rows
-                        if kb_config.DEBUG:
+                        if lss_config.DEBUG:
                             prf_ms = round((time.time() - t_prf) * 1000, 2)
                             print(f"PRF | exp_terms={len(expansion_terms)} | overlap={overlap:.2f} | {prf_ms}ms")
                     else:
-                        if kb_config.DEBUG:
+                        if lss_config.DEBUG:
                             print(f"PRF | DRIFT | overlap={overlap:.2f} < 0.4 | fallback")
 
     # Slice to TOP_OAI and dedupe 
@@ -667,7 +771,11 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     text_hashes = [h for _, _, _, h, _, _ in normalized_rows[:TOP_OAI]]
     file_paths = [fp for _, _, _, _, fp, _ in normalized_rows[:TOP_OAI]]
     indexed_ats = [ia for _, _, _, _, _, ia in normalized_rows[:TOP_OAI]]
-    braw = [1.0/(1.0+float(r)) for _, _, r, _, _, _ in normalized_rows[:TOP_OAI]]
+
+    # Custom BM25 re-scoring for the candidate set (replaces flat FTS5 bm25())
+    query_terms_for_bm25 = tok(q)
+    custom_bm25 = _custom_bm25_rescore(query_terms_for_bm25, texts, ids, cur)
+    braw = [custom_bm25.get(chunk_id, 0.0) for chunk_id in ids]
     bnorm = _minmax(braw)
 
     if len(texts) > 1:
@@ -754,10 +862,18 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
                 OAI_D_CACHE.put(("d", text_hash, OPENAI_MODEL, OPENAI_DIM), dv)
                 new_cache_data.append((text_hash, OPENAI_MODEL, OPENAI_DIM, version, dv.tobytes(), time.time()))
             
-            # Single executemany + commit for all new vectors
+            # Single executemany + commit for all new vectors.
+            # Best-effort: if DB is locked (e.g. by lss-sync), skip caching —
+            # embeddings will be re-computed on next search.  Search results are
+            # not affected because we already have the vectors in memory.
             if new_cache_data:
-                cache_con.executemany("INSERT OR REPLACE INTO embeddings VALUES (?,?,?,?,?,?)", new_cache_data)
-                cache_con.commit()
+                try:
+                    cache_con.executemany("INSERT OR REPLACE INTO embeddings VALUES (?,?,?,?,?,?)", new_cache_data)
+                    cache_con.commit()
+                except sqlite3.OperationalError as e:
+                    # DB locked — skip persistent cache, vectors are still in LRU
+                    if lss_config.DEBUG:
+                        log.debug("Embedding cache write skipped (DB busy): %s", e)
         
         # Compute similarities using cached vectors
         for i, text_hash in enumerate(text_hashes):
@@ -784,8 +900,12 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     onorm = _minmax(sims_o) if any(sims_o) else [0.0] * len(ids)
     sims_std = np.std(sims_o) if sims_o else 0.0
     
-    # Adaptive embedding weight based on BM25-embedding rank correlation
-    bm25_ranks = list(range(len(ids)))
+    # Rank by custom BM25 scores (higher = better) instead of FTS5 positional order
+    bm25_indexed = sorted(range(len(ids)), key=lambda i: -braw[i])
+    bm25_ranks = [0] * len(ids)
+    for rank, idx in enumerate(bm25_indexed):
+        bm25_ranks[idx] = rank
+
     embed_pairs = [(i, sims_o[i]) for i in range(len(ids))]
     embed_pairs.sort(key=lambda x: -x[1])
     embed_ranks = [0] * len(ids)
@@ -891,9 +1011,167 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     cache_hits = len(ids) - len(need_idx) if need_idx else len(ids)
     cache_pct = round(100 * cache_hits / len(ids), 1) if ids else 0
     
-    if kb_config.DEBUG:
+    if lss_config.DEBUG:
         df_hits = len([t for t in content_terms if t not in HOT_STOP_SET])
         print(f"LAT | docs={len(out)} | rerank={rerank_pool} | df_batch={len(content_terms)} | df_hits={df_hits} | embeds={nonzero_sims}/{len(ids)} | embed_batch={len(need_texts)} | cache={cache_pct}% | vec_cov={vector_coverage:.1%} | {round((time.time()-t_all)*1000,1)}ms")
     return out
 
-__all__ = ["semantic_search"]
+def _search_components(scope_path, query, mode="hybrid"):
+    """Low-level search returning {chunk_id: score} for a single query.
+    
+    mode:
+        "bm25"       — BM25 only (no embeddings, no API call)
+        "embedding"   — embedding similarity only (requires OpenAI API)
+        "hybrid"      — full RRF fusion (default)
+    
+    Returns dict of {chunk_id: float_score}.
+    Used by the evaluation harness.
+    """
+    from pathlib import Path
+
+    path = Path(scope_path).resolve()
+    lss_db_path = lss_store.get_db_path()
+
+    file_uid = None
+    if path.is_file():
+        file_uid = lss_store.get_file_uid(str(scope_path))
+        if not file_uid:
+            return {}
+
+    con = lss_store._init_db()
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    cur = con.cursor()
+    version = lss_store.VERSION_KEY
+
+    # ── S1: BM25 ─────────────────────────────────────────────────────────
+    all_terms = tok(query)
+    content_terms = [t for t in all_terms if len(t) > 2 and not re.fullmatch(r"\d+(\.\d+)?", t)]
+    df_map = _get_document_frequency_batch(content_terms, cur) if content_terms else {}
+    keys = _keywords(query, max_terms=16, con=cur, df_map=df_map)
+    main_query = _fts_or(keys)
+
+    rows = []
+    if main_query:
+        if file_uid is not None:
+            rows = cur.execute(
+                """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash
+                   FROM fts WHERE fts MATCH ? AND fts.file_uid = ? ORDER BY r LIMIT ?""",
+                (main_query, file_uid, K_SQL)
+            ).fetchall()
+        else:
+            path_prefix = str(path) + "/"
+            rows = cur.execute(
+                """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash
+                   FROM fts WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?) ORDER BY r LIMIT ?""",
+                (main_query, str(scope_path), path_prefix + "%", K_SQL)
+            ).fetchall()
+
+    if not rows:
+        con.close()
+        return {}
+
+    # For BM25-only mode, return more results than the embedding pipeline
+    # (which needs API calls per chunk) but not the full K_SQL pool — the
+    # FTS5 BM25 scores become very flat beyond the top ~100 results.
+    # For embedding/hybrid, limit to TOP_OAI for the embedding stage.
+    result_limit = min(len(rows), 200) if mode == "bm25" else TOP_OAI
+
+    ids = [r[0] for r in rows[:result_limit]]
+    texts = [r[1] for r in rows[:result_limit]]
+    bm25_raw = [r[2] for r in rows[:result_limit]]
+    text_hashes = [r[3] for r in rows[:result_limit]]
+
+    # ── Custom BM25 re-scoring ──────────────────────────────────────────
+    # FTS5's built-in bm25() produces flat scores on short passages.
+    # Re-score with proper BM25 using tunable k1/b and corpus statistics.
+    query_terms = tok(query)
+    bm25_scores = _custom_bm25_rescore(query_terms, texts, ids, cur)
+
+    if mode == "bm25":
+        con.close()
+        return bm25_scores
+
+    # ── S2: Embeddings ───────────────────────────────────────────────────
+    sims = {}
+    need_idx, need_texts, need_hashes = [], [], []
+
+    if text_hashes:
+        placeholders = ','.join(['?' for _ in text_hashes])
+        cache_rows = con.execute(
+            f"SELECT text_hash, vector FROM embeddings WHERE text_hash IN ({placeholders}) AND model=? AND dim=? AND version=?",
+            text_hashes + [OPENAI_MODEL, OPENAI_DIM, version]
+        ).fetchall()
+        cache_map = {row[0]: np.frombuffer(row[1], dtype=np.float32) for row in cache_rows}
+
+        for i, (text_hash, embed_text) in enumerate(zip(text_hashes, texts)):
+            cached_v = cache_map.get(text_hash)
+            if cached_v is None:
+                cached_v = OAI_D_CACHE.get(("d", text_hash, OPENAI_MODEL, OPENAI_DIM))
+            if cached_v is not None:
+                cache_map[text_hash] = cached_v
+            else:
+                need_idx.append(i)
+                need_texts.append(embed_text)
+                need_hashes.append(text_hash)
+    else:
+        cache_map = {}
+
+    embed_input = [query] + need_texts
+    V = _oai_embed(embed_input) if embed_input else None
+
+    if V is not None:
+        qv = V[0]
+        for j, (i, text_hash) in enumerate(zip(need_idx, need_hashes)):
+            dv = V[1 + j]
+            cache_map[text_hash] = dv
+            OAI_D_CACHE.put(("d", text_hash, OPENAI_MODEL, OPENAI_DIM), dv)
+
+        for i, text_hash in enumerate(text_hashes):
+            dv = cache_map.get(text_hash)
+            if dv is not None:
+                sims[ids[i]] = float(dv @ qv)
+            else:
+                sims[ids[i]] = 0.0
+    else:
+        con.close()
+        return bm25_scores  # embedding failed, fall back to BM25
+
+    if mode == "embedding":
+        con.close()
+        return sims
+
+    # ── S3: RRF Fusion ───────────────────────────────────────────────────
+    # Rank by custom BM25 scores (descending — higher = better)
+    bm25_sorted = sorted(bm25_scores.items(), key=lambda x: -x[1])
+    bm25_rank = {doc_id: rank for rank, (doc_id, _) in enumerate(bm25_sorted)}
+
+    # Rank by embedding similarity (descending)
+    embed_sorted = sorted(sims.items(), key=lambda x: -x[1])
+    embed_rank = {doc_id: rank for rank, (doc_id, _) in enumerate(embed_sorted)}
+
+    hybrid_scores = {}
+    for doc_id in ids:
+        br = bm25_rank.get(doc_id, len(ids))
+        er = embed_rank.get(doc_id, len(ids))
+        hybrid_scores[doc_id] = 1.0 / (RRF_K + br) + 1.0 / (RRF_K + er)
+
+    con.close()
+    return hybrid_scores
+
+
+def search_bm25_only(scope_path, queries):
+    """BM25-only search. Returns list of {chunk_id: score} dicts, one per query."""
+    return [_search_components(scope_path, q, mode="bm25") for q in queries]
+
+
+def search_embeddings_only(scope_path, queries):
+    """Embedding-only search. Returns list of {chunk_id: score} dicts, one per query."""
+    return [_search_components(scope_path, q, mode="embedding") for q in queries]
+
+
+def search_hybrid(scope_path, queries):
+    """Hybrid RRF search. Returns list of {chunk_id: score} dicts, one per query."""
+    return [_search_components(scope_path, q, mode="hybrid") for q in queries]
+
+
+__all__ = ["semantic_search", "search_bm25_only", "search_embeddings_only", "search_hybrid"]

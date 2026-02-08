@@ -1,17 +1,17 @@
-# Building kb-fusion for Linux AMD64
+# Building lss for Linux AMD64
 
-This guide explains how to build kb-fusion for linux/amd64 platform using Docker.
+This guide explains how to build lss for linux/amd64 platform using Docker.
 
 ## Quick Start
 
 ### Option 1: Build Wheel Only (Fast, ~30 seconds)
 
 ```bash
-docker buildx build --platform linux/amd64 -f Dockerfile.simple -t kb-fusion-wheel .
-docker run --platform linux/amd64 --rm -v "$PWD/dist-linux":/app kb-fusion-wheel
+docker buildx build --platform linux/amd64 -f Dockerfile.simple -t lss-wheel .
+docker run --platform linux/amd64 --rm -v "$PWD/dist-linux":/app lss-wheel
 ```
 
-This creates a Python wheel file (`kb_fusion-0.1.1-py3-none-any.whl`) that can be installed with pip on any Linux AMD64 system.
+This creates a Python wheel file (`local_semantic_search-0.4.0-py3-none-any.whl`) that can be installed with pip on any Linux AMD64 system.
 
 ### Option 2: Build Everything (Wheel + Standalone Binary, ~5-10 minutes)
 
@@ -22,14 +22,14 @@ This creates a Python wheel file (`kb_fusion-0.1.1-py3-none-any.whl`) that can b
 Or manually:
 
 ```bash
-docker buildx build --platform linux/amd64 -t kb-fusion-build .
+docker buildx build --platform linux/amd64 -t lss-build .
 mkdir -p dist-linux
-docker run --platform linux/amd64 --rm -v "$PWD/dist-linux":/app kb-fusion-build
+docker run --platform linux/amd64 --rm -v "$PWD/dist-linux":/app lss-build
 ```
 
 This creates:
-- `kb_fusion-0.1.1-py3-none-any.whl` - Python wheel package
-- `kb-linux-amd64` - Standalone executable (Nuitka-compiled)
+- `local_semantic_search-0.4.0-py3-none-any.whl` - Python wheel package
+- `lss-linux-amd64` - Standalone executable (Nuitka-compiled)
 
 ## Output
 
@@ -40,7 +40,7 @@ Build artifacts will be saved to `dist-linux/` directory.
 The wheel can be installed on any Linux AMD64 system with Python 3.9+:
 
 ```bash
-pip install kb_fusion-0.1.1-py3-none-any.whl
+pip install local_semantic_search-0.4.0-py3-none-any.whl
 ```
 
 ### Standalone Binary
@@ -48,8 +48,8 @@ pip install kb_fusion-0.1.1-py3-none-any.whl
 The Nuitka-compiled binary can be run directly without Python installed:
 
 ```bash
-chmod +x kb-linux-amd64
-./kb-linux-amd64 search /path/to/file "query"
+chmod +x lss-linux-amd64
+./lss-linux-amd64 "query" /path/to/dir
 ```
 
 ## Requirements
@@ -84,7 +84,7 @@ chmod +x kb-linux-amd64
 
 2. Rebuild from scratch:
    ```bash
-   docker buildx build --no-cache --platform linux/amd64 -t kb-fusion-build .
+   docker buildx build --no-cache --platform linux/amd64 -t lss-build .
    ```
 
 ### Permission Errors
@@ -106,6 +106,3 @@ They will NOT run on:
 - ARM64 Linux (Raspberry Pi, AWS Graviton, etc.) - use `--platform linux/arm64`
 - Windows native - requires separate Windows build
 - macOS - requires separate macOS build
-
-
-

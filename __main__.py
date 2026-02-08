@@ -1,6 +1,6 @@
 # __main__.py
 import sys
-from .kb_fusion import main
+from .lss_cli import main
 
 if __name__ == "__main__":
     sys.exit(main())

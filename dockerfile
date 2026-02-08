@@ -30,13 +30,13 @@ RUN uv build --wheel --out-dir /output
 # Build standalone executable with PyInstaller
 RUN uv run pyinstaller \
     --onefile \
-    --name kb-linux-amd64 \
+    --name lss-linux-amd64 \
     --distpath /output \
     --workpath /tmp/pyinstaller \
     --specpath /tmp \
     --clean \
     --noconfirm \
-    kb_fusion.py
+    lss_cli.py
 
 # Default command: copy output to mounted volume
 CMD ["sh", "-c", "cp -r /output/* /app/ && echo 'Build artifacts:' && ls -lh /app/"]

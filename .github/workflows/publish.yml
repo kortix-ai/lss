@@ -1,0 +1,46 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Verify wheel contents
+        run: |
+          python -c "
+          import zipfile, sys, pathlib
+          whl = list(pathlib.Path('dist').glob('*.whl'))[0]
+          names = zipfile.ZipFile(whl).namelist()
+          bad = [n for n in names if n.endswith('.env') or 'test' in n.lower()]
+          if bad:
+              print(f'ERROR: wheel contains unexpected files: {bad}', file=sys.stderr)
+              sys.exit(1)
+          print(f'Wheel OK: {len(names)} files')
+          for n in sorted(names):
+              print(f'  {n}')
+          "
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

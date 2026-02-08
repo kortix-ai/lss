@@ -4,24 +4,55 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
+only-include = [
+  "__main__.py",
+  "lss_cli.py",
+  "lss_config.py",
+  "lss_store.py",
+  "lss_sync.py",
+  "semantic_search.py",
+]
 
 [project]
-name = "kb-fusion"
-version = "0.1.2"
-description = "Hybrid semantic search for local knowledge bases (SQLite FTS5 + embeddings)."
+name = "local-semantic-search"
+version = "0.4.0"
+description = "Local semantic search over your files — BM25 + OpenAI embeddings with real-time file watching."
 authors = [{ name = "Kortix", email = "oss@kortix.so" }]
 license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.9"
+keywords = ["search", "semantic-search", "bm25", "embeddings", "local", "cli"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Text Processing :: Indexing",
+  "Topic :: Software Development :: Libraries",
+]
 dependencies = [
   "numpy>=1.24",
   "openai>=1.30.0",
   "pypdf2>=3.0.0",
+  "watchdog>=4.0.0",
 ]
 
+[project.scripts]
+lss = "lss_cli:main"
+lss-sync = "lss_sync:main"
+
 [project.urls]
-Homepage = "https://github.com/kortix/kb-fusion"
-Issues = "https://github.com/kortix/kb-fusion/issues"
+Homepage = "https://github.com/kortix-ai/lss"
+Documentation = "https://github.com/kortix-ai/lss#readme"
+Issues = "https://github.com/kortix-ai/lss/issues"
+Changelog = "https://github.com/kortix-ai/lss/releases"
 
 [project.optional-dependencies]
 dev = [
@@ -30,6 +61,7 @@ dev = [
   "ruff>=0.5.0",
   "black>=24.3.0",
   "pre-commit>=3.7.0",
+  "ranx>=0.3.16",
 ]
 build = [
   "nuitka>=2.4",
