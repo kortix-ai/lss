@@ -230,8 +230,10 @@ def _resolve_search_args(args):
     if path:
         return Path(path).resolve(), queries
 
-    # Smart detection: check if the last positional arg is an existing path
-    if queries:
+    # Smart detection: if there are 2+ positional args and the last one
+    # looks like an existing path, treat it as the search path.
+    # With only 1 arg, always treat it as a query (use -p for path).
+    if len(queries) >= 2:
         last = queries[-1]
         candidate = Path(last).expanduser()
         if candidate.exists() and (candidate.is_dir() or candidate.is_file()):
