@@ -1,6 +1,6 @@
 # LSS Architecture & Pipeline Reference
 
-> Local Semantic Search — how it works, step by step, with real timing data.
+> Local Semantic Search v0.5.0 — how it works, step by step, with real timing data.
 
 ---
 
@@ -9,7 +9,7 @@
 LSS finds content in your files by combining two complementary search strategies:
 
 1. **BM25** (keyword match via SQLite FTS5) — fast, exact, zero-cost
-2. **OpenAI embeddings** (semantic similarity) — understands meaning, costs API calls
+2. **Embeddings** (semantic similarity via OpenAI or local fastembed) — understands meaning
 
 Results from both are merged using **Reciprocal Rank Fusion (RRF)**, then re-ranked with **MMR** (Maximal Marginal Relevance) for diversity.
 
@@ -20,13 +20,13 @@ user query
 [INDEXING PIPELINE]          [SEARCH PIPELINE]
 file discovery               tokenize + DF lookup
     |                            |
-text detection               keyword extraction
+inclusion filter             keyword extraction
     |                            |
-read + extract               FTS5 BM25 query
+document extraction          FTS5 BM25 query
     |                            |
 normalize                    PRF expansion (optional)
     |                            |
-chunk (220-word spans)       OpenAI embedding API  <-- BOTTLENECK
+smart chunking               embedding (OpenAI or local)
     |                            |
 hash (MD5)                   embedding cache lookup
     |                            |
@@ -47,11 +47,11 @@ Triggered by `lss "query" <dir>` (auto-index) or `lss index <dir>`.
 
 | # | Step | What it does | Time (8 files, 59KB) | % |
 |---|------|-------------|---------------------|---|
-| 1 | **File discovery** | `os.walk` + in-place dir pruning + filter excluded dirs/extensions/names | 16.0 ms | 25% |
-| 2 | **Text detection** | Extension fast-path → byte-level check (read 8KB) | 0.2 ms | <1% |
-| 3 | **Read + extract** | UTF-8 read, JSON/CSV/JSONL parsing, PDF via PyPDF2 | 0.7 ms | 1% |
+| 1 | **File discovery** | `os.walk` + in-place dir pruning + inclusion filter + .gitignore parsing | 16.0 ms | 25% |
+| 2 | **Inclusion filter** | Check against `INDEXED_EXTENSIONS` allowlist (~80 exts) + `KNOWN_EXTENSIONLESS` + user includes | 0.1 ms | <1% |
+| 3 | **Document extraction** | Dispatch by extension: plain text read, or PDF/DOCX/XLSX/PPTX/HTML/EML/JSON/CSV extraction | 0.7 ms | 1% |
 | 4 | **Normalize** | Unicode NFKC + whitespace collapse | 1.1 ms | 2% |
-| 5 | **Chunk** | Sliding window: 220 words/span, 200-word stride | 0.2 ms | <1% |
+| 5 | **Smart chunking** | Extension-aware: markdown heading splits, Python def/class splits, or word-window | 0.2 ms | <1% |
 | 6 | **Hash** | MD5 content signature (file) + MD5 per chunk | 0.5 ms | 1% |
 | 7 | **DB write** | FTS5 INSERT + files manifest + COMMIT | 45.6 ms | **71%** |
 | | **TOTAL** | | **64.1 ms** | |
@@ -59,7 +59,7 @@ Triggered by `lss "query" <dir>` (auto-index) or `lss index <dir>`.
 
 ### Key insight — Indexing
 
-**DB writes dominate indexing (71%).** The actual text processing (read, normalize, chunk, hash) takes <5 ms combined. SQLite FTS5 INSERT + WAL commit is the bottleneck. This is acceptable because:
+**DB writes dominate indexing (71%).** The actual text processing (read, extract, normalize, chunk, hash) takes <5 ms combined. SQLite FTS5 INSERT + WAL commit is the bottleneck. This is acceptable because:
 
 - Indexing happens once per file (content-addressed via MD5)
 - Re-indexing unchanged files hits the LRU fast path (~0.2 ms/file)
@@ -71,6 +71,142 @@ When a file hasn't changed (same path + size + mtime + version key):
 1. Check in-memory LRU cache (O(1) hash lookup) → **0.01 ms**
 2. If not in LRU, check SQLite `files` table with size/mtime guard → **0.2 ms**
 3. No content hashing, no text extraction, no FTS writes
+
+---
+
+## Document Extraction Pipeline
+
+New in v0.5.0. File: `lss_extract.py`.
+
+The main dispatcher `extract_text(file_path)` routes by extension:
+
+| Format | Library | What's extracted |
+|--------|---------|-----------------|
+| **PDF** | pdfminer.six | Layout-aware text from all pages |
+| **DOCX** | python-docx | Paragraphs + table cells |
+| **XLSX** | openpyxl | All sheets, row by row, cells tab-separated |
+| **PPTX** | python-pptx | Slide text frames + table cells |
+| **HTML** | beautifulsoup4 | Visible text (scripts/styles stripped) |
+| **EML** | stdlib `email` | Subject + From + plain-text body |
+| **JSON** | stdlib `json` | Pretty-printed (all values searchable) |
+| **JSONL** | stdlib | Each line parsed + pretty-printed |
+| **CSV** | stdlib `csv` | Rows formatted as "header: value" pairs |
+
+All extraction functions return `""` on any error (never raise). If a library isn't installed, that format is silently skipped. Plain text files (code, markdown, config) are read directly via UTF-8.
+
+---
+
+## Smart Chunking
+
+New in v0.5.0. Replaced the fixed word-window approach.
+
+`_smart_chunk(text, ext)` dispatches by file extension:
+
+### Markdown chunking (`.md`)
+
+Splits on heading lines (`# ...`, `## ...`, etc.):
+1. Walk lines, accumulate into sections
+2. Each `# heading` starts a new chunk
+3. Chunks smaller than threshold are merged with the next section
+4. Chunks larger than the word-window limit are sub-chunked with word-window
+
+### Python chunking (`.py`)
+
+Splits on definition boundaries:
+1. Walk lines, split on `def ` and `class ` at the start of a line
+2. Each definition starts a new chunk (includes decorators if adjacent)
+3. Top-of-file imports/comments form their own chunk
+4. Oversized chunks are sub-chunked with word-window
+
+### Default chunking (everything else)
+
+Sliding word-window:
+- **Span size:** 220 words (~1 paragraph of dense text)
+- **Stride:** 200 words (20-word overlap between consecutive spans)
+- **Why overlapping:** Ensures no sentence falls on a boundary and gets missed
+
+A 1000-word file produces ~5 chunks. A 10,000-word file produces ~50 chunks.
+
+### Per chunk
+
+Each chunk gets:
+- An MD5 hash (for deduplication and embedding cache lookup)
+- An FTS5 entry (for BM25 keyword search)
+- An embedding vector (computed lazily on first search, cached permanently)
+
+---
+
+## Inclusion-Based File Filtering
+
+New in v0.5.0. Replaced the binary-detection approach with an **allowlist**.
+
+### Why inclusion-based?
+
+The old approach tried to detect binary files by reading bytes. This was slow, error-prone, and indexed junk (minified JS, generated code, data files with text-like content). The new approach only indexes files with **known extensions**.
+
+### Filter layers
+
+| Layer | What | Examples |
+|-------|------|---------|
+| 1. **Directory exclusions** | Entire trees pruned during `os.walk` | `node_modules/`, `.git/`, `__pycache__/`, `.venv/`, `dist/`, `build/` (~70 names) |
+| 2. **`.gitignore` parsing** | Reads `.gitignore` in each subtree, applies patterns as additional excludes | `*.pyc`, `dist/`, `.env` |
+| 3. **`INDEXED_EXTENSIONS`** | Allowlist of ~80 known text/code/doc extensions | `.py`, `.js`, `.md`, `.pdf`, `.docx`, `.yaml`, etc. |
+| 4. **`KNOWN_EXTENSIONLESS`** | Named files without extensions | `Makefile`, `Dockerfile`, `LICENSE`, `README`, `.gitignore` |
+| 5. **Excluded files** | Specific file names always skipped | `package-lock.json`, `yarn.lock`, `.DS_Store` |
+| 6. **Max file size** | 2 MB default | Override with `LSS_MAX_FILE_SIZE` |
+| 7. **User config** | `lss include add .ext` / `lss exclude add "*.log"` | Custom extensions and glob patterns |
+
+**Unknown extensions are skipped by default.** This is the key design decision — it's better to miss a rare file type (user can add with `lss include add`) than to index thousands of junk files.
+
+---
+
+## Dual Embedding Provider Architecture
+
+New in v0.5.0.
+
+### Provider detection (`lss_config.py`)
+
+`_detect_provider()` runs at import time:
+
+1. Check `LSS_PROVIDER` env var → if set, use it
+2. Check `~/.lss/config.json` `embedding_provider` field → if set, use it
+3. Check `OPENAI_API_KEY` env var → if set, use `"openai"`
+4. Check if `fastembed` is importable → if yes, use `"local"`
+5. Fall back to `"openai"` (will fail with helpful error on first search)
+
+### Module-level vars (`semantic_search.py`)
+
+```python
+EMBED_PROVIDER = lss_config.EMBEDDING_PROVIDER  # "openai" or "local"
+EMBED_MODEL    = ...  # "text-embedding-3-small" or "BAAI/bge-small-en-v1.5"
+EMBED_DIM      = ...  # 256 or 384
+```
+
+These replace the old `OPENAI_MODEL`/`OPENAI_DIM` constants. All cache keys use `EMBED_MODEL` and `EMBED_DIM`.
+
+### The `_embed()` dispatcher
+
+```python
+def _embed(texts: list[str]) -> list[list[float]]:
+    if EMBED_PROVIDER == "local":
+        return _local_embed(texts)
+    return _oai_embed(texts)
+```
+
+- `_oai_embed()`: OpenAI API call (batched, with retry/timeout)
+- `_local_embed()`: fastembed `TextEmbedding` (lazy singleton, runs on CPU)
+
+### VERSION_KEY
+
+```python
+VERSION_KEY = f"{EMBED_MODEL}:{EMBED_DIM}:p{PIPELINE_VERSION}:c{CHUNKING_VERSION}"
+```
+
+The version key incorporates the embedding provider. Switching providers (e.g., `lss config provider local`) changes the version key, which triggers re-embedding on next search. The BM25 index stays intact — only embedding vectors are recomputed.
+
+### Lazy imports
+
+OpenAI is imported inside `_oai_embed()`, not at module level. This means `import semantic_search` works even without `openai` installed (important for local-only users).
 
 ---
 
@@ -87,30 +223,37 @@ Triggered by `lss "query"` or `lss search "query" -p <dir>`.
 | 3 | **FTS5 BM25 query** | `WHERE fts MATCH ? ORDER BY bm25(fts) LIMIT 600` | 0.4 | 0.4 | 0.3 |
 | 4 | **PRF expansion** | Pseudo-relevance feedback: extract terms from top-10 docs, re-query | 0-2 | 0-2 | 0-1 |
 | 5 | **Jaccard dedup** | Remove near-duplicate chunks (threshold=0.83) | <0.1 | <0.1 | <0.1 |
-| 6 | **OpenAI embedding** | Single API call: [query] + [top-28 doc chunks] | **565** | **0.1*** | **0.1*** |
+| 6 | **Embedding** | OpenAI API call or local fastembed inference | **565** / **50*** | **0.1**† | **0.1**† |
 | 7 | **Embedding cache** | Write new vectors to SQLite `embeddings` table | 1-5 | 0 | 0 |
 | 8 | **RRF fusion** | Reciprocal Rank Fusion of BM25 + embedding ranks | <0.1 | <0.1 | <0.1 |
 | 9 | **Post-fusion boost** | Jaccard, phrase, digit co-mention features | <0.1 | <0.1 | <0.1 |
 | 10 | **MMR re-ranking** | Vector-MMR (lambda=0.7) for diversity, if coverage >= 90% | <0.1 | <0.1 | <0.1 |
-| | **TOTAL** | | **~570** | **~157** | **~122** |
+| | **TOTAL (OpenAI)** | | **~570** | **~157** | **~122** |
+| | **TOTAL (local)** | | **~55** | **~5** | **~2** |
 
-*\* Warm/hot: embeddings served from SQLite cache or in-memory LRU*
+*\* Local cold: fastembed model load (~2s first time, then ~50ms inference)*
+*† Warm/hot: embeddings served from SQLite cache or in-memory LRU*
 
 ### Key insight — Search
 
-**The OpenAI embedding API call dominates cold search (90%+ of wall time).** Everything else — BM25, fusion, MMR — takes <2 ms combined. The caching strategy is critical:
+**With OpenAI:** The API call dominates cold search (90%+ of wall time). Everything else — BM25, fusion, MMR — takes <2 ms combined.
+
+**With local embeddings:** No network dependency. Cold search is dominated by fastembed model load (one-time), then inference is ~50ms. Warm/hot searches are effectively instant.
+
+### Caching strategy
 
 | Cache layer | Scope | TTL | Lookup cost |
 |-------------|-------|-----|-------------|
 | **LRU (in-memory)** | Per-process, query + doc vectors | 15 min (query), 60 min (doc) | ~0.001 ms |
 | **SQLite `embeddings` table** | Persistent, doc vectors only | Forever (until sweep) | ~0.1 ms |
 | **OpenAI API** | N/A | N/A | **150-600 ms** |
+| **fastembed inference** | N/A | N/A | **30-80 ms** |
 
 ### Three thermal states
 
-- **Cold** (~570 ms): First search ever, no caches. Hits OpenAI API for query + all doc embeddings.
-- **Warm** (~157 ms): Doc embeddings cached in SQLite. Only query embedding hits API (but even that may be cached in LRU if same query repeated).
-- **Hot** (~122 ms): Everything in LRU. Zero API calls. Pure local compute.
+- **Cold** (~570ms OpenAI / ~55ms local): First search ever, no caches. Hits API or runs inference for query + all doc embeddings.
+- **Warm** (~157ms OpenAI / ~5ms local): Doc embeddings cached in SQLite. Only query embedding needed.
+- **Hot** (~122ms OpenAI / ~2ms local): Everything in LRU. Zero API calls, zero inference. Pure local compute.
 
 After a directory is searched once, subsequent searches are warm or hot.
 
@@ -118,7 +261,7 @@ After a directory is searched once, subsequent searches are warm or hot.
 
 ## File Filtering — What Gets Indexed
 
-LSS uses a three-layer filter to avoid indexing junk:
+LSS uses a multi-layer filter with an inclusion-based approach:
 
 ### Layer 1: Directory exclusions (`EXCLUDED_DIRS`)
 
@@ -132,36 +275,42 @@ Entire directory trees are pruned in-place during `os.walk`. This is the most im
 
 Full list: ~70 directory names. See `EXCLUDED_DIRS` in `lss_store.py`.
 
-### Layer 2: File name/extension exclusions
+### Layer 2: `.gitignore` parsing
 
-**Binary extensions** (`BINARY_EXTENSIONS`): ~100 extensions that are always binary — skipped without reading any bytes. Images, video, audio, archives, compiled code, fonts, ML models, etc.
+During `os.walk`, lss reads `.gitignore` files in each subtree and applies their patterns as additional file/directory exclusions. This means generated files, build artifacts, and other gitignored content is automatically skipped.
 
-**Excluded file names** (`EXCLUDED_FILES`): Lock files, env files, OS junk:
+### Layer 3: Inclusion-based extension filtering (`INDEXED_EXTENSIONS`)
+
+~80 known text/code/document extensions are indexed. Unknown extensions are **skipped by default**.
+
+**Code:** `.py`, `.js`, `.ts`, `.jsx`, `.tsx`, `.go`, `.rs`, `.java`, `.c`, `.cpp`, `.h`, `.rb`, `.php`, `.swift`, `.kt`, `.scala`, `.lua`, `.r`, `.jl`, `.m`, `.sh`, `.bash`, `.zsh`, `.fish`, `.ps1`, `.bat`, `.cmd`, etc.
+
+**Markup:** `.md`, `.rst`, `.tex`, `.html`, `.htm`, `.xml`, `.svg`, `.yaml`, `.yml`, `.json`, `.toml`, `.ini`, `.cfg`, `.conf`
+
+**Documents:** `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.eml`, `.csv`, `.tsv`, `.jsonl`
+
+**Known extensionless:** `Makefile`, `Dockerfile`, `LICENSE`, `README`, `.gitignore`, `.dockerignore`, `.editorconfig`, etc.
+
+### Layer 4: Excluded file names
+
+Lock files, env files, OS junk:
 ```
 package-lock.json, yarn.lock, pnpm-lock.yaml, poetry.lock,
 Cargo.lock, go.sum, .DS_Store, .env, .env.local, ...
 ```
 
-**Max file size** (`LSS_MAX_FILE_SIZE`): 2 MB default. Files larger than this are skipped. Override with `LSS_MAX_FILE_SIZE=10485760` (10 MB).
+### Layer 5: Max file size
 
-### Layer 3: Content-based detection
+2 MB default. Files larger than this are skipped. Override with `LSS_MAX_FILE_SIZE=10485760` (10 MB).
 
-For files that pass layers 1-2, `_is_text_file()` reads the first 8 KB and checks:
-1. No null bytes (binary indicator)
-2. Valid UTF-8
-3. Fallback: Latin-1 with >70% printable characters
+### Layer 6: User-configured includes/excludes
 
-### Layer 4: User-configured exclusions
-
-`lss exclude add <pattern>` adds glob patterns to `~/.lss/config.json`:
-```
-lss exclude add "*.log"
-lss exclude add "*.min.js"
+```bash
+lss include add .rst        # add a custom extension
+lss include add .tex
+lss exclude add "*.log"     # add a glob exclusion pattern
 lss exclude add "generated"
-lss exclude add "*.snap"
 ```
-
-These are checked via `fnmatch` against file names and relative paths.
 
 ---
 
@@ -177,7 +326,7 @@ CREATE TABLE files (
     size        INTEGER,
     mtime       REAL,
     content_sig TEXT NOT NULL,     -- MD5 hex of file content
-    version     TEXT NOT NULL,     -- "text-embedding-3-small:256:p2:c4"
+    version     TEXT NOT NULL,     -- "BAAI/bge-small-en-v1.5:384:p2:c4"
     indexed_at  REAL,
     status      TEXT DEFAULT 'active'  -- active | missing
 );
@@ -198,10 +347,10 @@ CREATE VIRTUAL TABLE fts_vocab USING fts5vocab(fts, row);
 -- Embedding vector cache (persistent across sessions)
 CREATE TABLE embeddings (
     text_hash BLOB,       -- MD5 binary of chunk text
-    model     TEXT,        -- "text-embedding-3-small"
-    dim       INTEGER,     -- 256
+    model     TEXT,        -- "BAAI/bge-small-en-v1.5" or "text-embedding-3-small"
+    dim       INTEGER,     -- 384 or 256
     version   TEXT,
-    vector    BLOB,        -- float32 array, 256 * 4 = 1024 bytes
+    vector    BLOB,        -- float32 array
     created   REAL DEFAULT (unixepoch()),
     PRIMARY KEY (text_hash, model, dim, version)
 );
@@ -220,20 +369,43 @@ CREATE TABLE embeddings (
 
 ---
 
-## Chunking Strategy
+## Query-Time Search Filters
 
-Files are chunked into overlapping spans:
+New in v0.5.1. Three filter types available at search time:
 
-- **Span size:** 220 words (~1 paragraph of dense text)
-- **Stride:** 200 words (20-word overlap between consecutive spans)
-- **Why overlapping:** Ensures no sentence falls on a boundary and gets missed
+### Extension include (`-e` / `--ext`)
 
-A 1000-word file produces ~5 chunks. A 10,000-word file produces ~50 chunks.
+```bash
+lss "auth" -e .py -e .ts
+```
 
-Each chunk gets:
-- An MD5 hash (for deduplication and embedding cache lookup)
-- An FTS5 entry (for BM25 keyword search)
-- An embedding vector (computed lazily on first search, cached permanently)
+Applied in SQL: adds `AND (fts.file_path LIKE '%.py' OR fts.file_path LIKE '%.ts')` to the WHERE clause. This filters **before** BM25 scoring, so only matching files are scored and ranked. Very efficient.
+
+### Extension exclude (`-E` / `--exclude-ext`)
+
+```bash
+lss "config" -E .json -E .yaml
+```
+
+Applied in SQL: adds `AND fts.file_path NOT LIKE '%.json' AND fts.file_path NOT LIKE '%.yaml'`. Also pre-scoring.
+
+When both `-e` and `-E` are used, include is applied first, then exclude removes from the include set. E.g., `-e .py -e .ts -E .ts` → only `.py`.
+
+### Content regex exclude (`-x` / `--exclude-pattern`)
+
+```bash
+lss "user data" -x '\d{4}-\d{2}-\d{2}'
+```
+
+Applied **post-scoring**: after BM25 + embedding + RRF + MMR produce the final ranked list, chunks whose snippet matches any regex pattern are removed. This is less efficient than SQL filtering (scoring happens on all candidates) but necessary because regex filtering requires the actual text content.
+
+Multiple patterns combine with OR (a chunk is excluded if **any** pattern matches).
+
+### Implementation detail
+
+Extension filter SQL is built once by `_ext_filter_sql()` and injected into all SQL queries (initial BM25, PRF expansion). The `fts.file_path` column is `UNINDEXED` in FTS5 — it can't be used in MATCH but works fine in WHERE with LIKE.
+
+Content regex patterns are compiled once in `semantic_search()` and passed as compiled `re.Pattern` objects. Invalid regex is caught early with a helpful error message.
 
 ---
 
@@ -287,7 +459,8 @@ Process:
 1. Collect top-28 BM25 results after Jaccard deduplication
 2. Check SQLite `embeddings` table for cached vectors (batch SELECT)
 3. Check in-memory LRU cache for remaining
-4. Single OpenAI API call: `[query] + [uncached_doc_texts]`
+4. **OpenAI:** Single API call: `[query] + [uncached_doc_texts]`
+   **Local:** fastembed batch inference: `[query] + [uncached_doc_texts]`
 5. Store new vectors in SQLite + LRU cache
 6. Compute cosine similarity: `doc_vec @ query_vec`
 
@@ -321,17 +494,18 @@ This prevents returning 5 nearly-identical chunks from the same file.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `LSS_PROVIDER` | (auto-detect) | `openai` or `local` — embedding provider override |
 | `LSS_DIR` | `~/.lss` | Data directory |
-| `OPENAI_API_KEY` | (required) | OpenAI API key for embeddings |
-| `OPENAI_MODEL` | `text-embedding-3-small` | Embedding model |
-| `OPENAI_DIM` | `256` | Embedding dimensions |
+| `OPENAI_API_KEY` | (required for openai) | OpenAI API key for embeddings |
+| `OPENAI_MODEL` | `text-embedding-3-small` | OpenAI embedding model |
+| `OPENAI_DIM` | `256` | OpenAI embedding dimensions |
 | `LSS_MAX_FILE_SIZE` | `2097152` (2 MB) | Max file size to index |
 | `OAI_TIMEOUT` | `2.0` | OpenAI API timeout (seconds) |
 | `LSS_SPAN_WORDS` | `220` | Words per chunk |
 | `LSS_SPAN_STRIDE` | `200` | Stride between chunks |
 | `LSS_K_SQL` | `600` | BM25 candidate limit |
 | `LSS_K_FINAL` | `20` | Final result pool size |
-| `LSS_TOP_OAI` | `28` | Docs sent to embedding API |
+| `LSS_TOP_OAI` | `28` | Docs sent to embedding |
 | `BM25_K1` | `1.2` | BM25 term frequency saturation |
 | `BM25_B` | `0.75` | BM25 document length normalization |
 | `RRF_K` | `60` | RRF smoothing constant |
@@ -341,8 +515,10 @@ This prevents returning 5 nearly-identical chunks from the same file.
 
 ```json
 {
+  "embedding_provider": "local",
   "watch_paths": ["/Users/me/Documents", "/Users/me/Projects"],
-  "exclude_patterns": ["*.log", "*.min.js", "generated"]
+  "exclude_patterns": ["*.log", "*.min.js", "generated"],
+  "include_extensions": [".rst", ".tex"]
 }
 ```
 
@@ -361,28 +537,61 @@ This prevents returning 5 nearly-identical chunks from the same file.
 
 ### Search latency
 
-| Scenario | Latency |
-|----------|---------|
-| Cold (first search, no cache) | 400-800 ms |
-| Warm (embeddings in SQLite) | 100-200 ms |
-| Hot (all in LRU) | 50-150 ms |
-| BM25-only (numeric query) | 1-5 ms |
+| Scenario | OpenAI | Local |
+|----------|--------|-------|
+| Cold (first search, no cache) | 400-800 ms | 50-200 ms |
+| Warm (embeddings in SQLite) | 100-200 ms | 5-50 ms |
+| Hot (all in LRU) | 50-150 ms | 2-10 ms |
+| BM25-only (numeric query) | 1-5 ms | 1-5 ms |
 
 ### What makes it slow
 
-1. **OpenAI API call** — 150-600 ms per call, unavoidable on cold search
-2. **Network latency** — API round-trip time dominates
-3. **DB writes during indexing** — SQLite FTS5 INSERT + WAL commit
-4. **Large directories** — `os.walk` + `_is_text_file` for thousands of files
+1. **OpenAI API call** — 150-600 ms per call, unavoidable on cold search (OpenAI provider only)
+2. **fastembed model load** — ~2s on first use (cached in memory after)
+3. **Network latency** — API round-trip time (OpenAI provider only)
+4. **DB writes during indexing** — SQLite FTS5 INSERT + WAL commit
+5. **Large directories** — `os.walk` + filtering for thousands of files
 
 ### What makes it fast
 
 1. **Content-addressed caching** — same content = same hash = cached embedding
 2. **LRU in-memory cache** — repeated queries are instant
 3. **Fast-path re-indexing** — stat() check, no content reading
-4. **Extension-based filtering** — binary files skipped without I/O
-5. **Single batched API call** — query + all docs in one request
+4. **Inclusion-based filtering** — unknown extensions skipped without I/O
+5. **Single batched API/inference call** — query + all docs in one request
 6. **WAL mode** — readers never block writers, writers never block readers
+7. **Local embeddings** — zero network dependency, ~50ms inference
+
+---
+
+## Project Layout
+
+```
+lss_config.py          Config: paths, env vars, provider detection, load/save
+lss_extract.py         Document extractors: PDF, DOCX, XLSX, PPTX, HTML, EML, JSON, CSV
+lss_store.py           Indexing: file discovery, inclusion filtering, smart chunking, FTS5
+lss_cli.py             CLI: search, index, status, config, watch, include, exclude, eval, update
+lss_sync.py            File watcher daemon (watchdog + debounced indexing)
+semantic_search.py     Search: BM25, dual embedding providers, RRF, PRF, MMR
+```
+
+### Test suite — 366 tests
+
+| Test file | Count | Description |
+|---|---|---|
+| `test_extract.py` | 39 | Document format extractors |
+| `test_filtering.py` | 95 | Inclusion-based file filtering |
+| `test_chunking.py` | 15 | Smart chunking (markdown/python/default) |
+| `test_lss_store.py` | 14 | Storage layer |
+| `test_lss_cli.py` | 21 | CLI unit tests |
+| `test_e2e.py` | 25 | End-to-end workflows |
+| `test_lss_sync.py` | 15 | File watcher daemon |
+| `test_embedding_provider.py` | 23 | Provider detection, local embed, config |
+| `test_cli_validation.py` | 92 | Full CLI surface area |
+| `test_benchmark.py` | 11 | Performance benchmarks (OpenAI) |
+| `test_search.py` | 6 | Search pipeline (OpenAI) |
+| `test_search_quality.py` | 10 | Search quality metrics (OpenAI) |
+| `test_beir.py` | 9 | BEIR benchmark adapter (excluded from default run) |
 
 ---
 
@@ -392,22 +601,31 @@ This prevents returning 5 nearly-identical chunks from the same file.
 
 LSS includes a comprehensive search quality evaluation framework in `tests/evaluation/`:
 
-- **Golden set** (`golden_set.json`): 40 hand-labeled queries across 6 categories (keyword, conceptual, procedural, multi_concept, short_vague) with 3-level graded relevance (0/1/2) against a 30-file synthetic project corpus
+- **Golden set** (`golden_set.json`): 40 hand-labeled queries across 6 categories (keyword, conceptual, procedural, multi_concept, short_vague) with 3-level graded relevance (0/1/2) against a 33-file synthetic project corpus
 - **BEIR adapter** (`beir_adapter.py`): Runs standard BEIR benchmark datasets through lss for comparison with published baselines
 - **Evaluation harness** (`harness.py`): Orchestrates three-way comparison (BM25 / embedding / hybrid) using [ranx](https://github.com/AmenRa/ranx) for NDCG, MRR, Recall, Precision, MAP metrics
 
-### Golden Set Results (40 queries, 30-file corpus)
+### Golden Set Results — OpenAI (text-embedding-3-small, 256d)
 
 ```
 Method         NDCG@5  NDCG@10   MRR@10  Recall@5  Recall@10    P@5   P@10   MAP@10
-bm25            0.885    0.901    0.988     0.857      0.906  0.485  0.258    0.822
-embedding       0.860    0.901    0.988     0.801      0.930  0.450  0.267    0.796
-hybrid          0.910    0.929    1.000     0.893      0.948  0.505  0.273    0.846
+bm25            0.870    0.885    0.988     0.845      0.893  0.480  0.255    0.809
+embedding       0.844    0.886    0.988     0.788      0.917  0.445  0.265    0.784
+hybrid          0.896    0.914    1.000     0.887      0.936  0.505  0.270    0.834
 ```
 
-With custom BM25 re-scoring (v0.4.0), BM25-only search matches embedding-only on NDCG@10. The hybrid fusion still wins across all metrics.
+### Golden Set Results — Local (bge-small-en-v1.5, 384d)
 
-Run this evaluation yourself: `lss eval`
+```
+Method         NDCG@5  NDCG@10   MRR@10  Recall@5  Recall@10    P@5   P@10   MAP@10
+bm25            0.870    0.885    0.988     0.845      0.893  0.480  0.255    0.809
+embedding       0.848    0.894    1.000     0.777      0.923  0.440  0.267    0.783
+hybrid          0.888    0.911    1.000     0.864      0.931  0.495  0.268    0.834
+```
+
+Local embeddings are within **0.3%** of OpenAI on hybrid NDCG@10 — and **8x faster** (no network calls). BM25 scores are identical (same algorithm, same corpus).
+
+Run this evaluation yourself: `lss eval` (uses current provider) or `LSS_PROVIDER=local lss eval`
 
 ### BEIR SciFact (5,183 biomedical docs, 300 queries)
 
@@ -442,4 +660,4 @@ Competitive with top systems. Note: hybrid slightly below embedding-only on biom
 
 - **FTS5 Porter stemmer** is less capable than Lucene's analyzer on domain-specific vocabulary (medical, legal). This primarily affects BM25's contribution to hybrid search on specialized corpora.
 - **Short passage scoring** — FTS5's built-in `bm25()` function produces flat scores when passages are short and uniform in length. Our custom BM25 re-scorer mitigates this.
-- **Single-language** — FTS5 tokenizer is English-optimized. Non-Latin scripts may not tokenize well for BM25 (embedding search still works via OpenAI's multilingual models).
+- **Single-language** — FTS5 tokenizer is English-optimized. Non-Latin scripts may not tokenize well for BM25 (embedding search still works via multilingual models).

@@ -30,7 +30,7 @@ import argparse, sys, json, os, sqlite3, time
 from pathlib import Path
 from typing import List
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Set debug BEFORE importing other modules
 import lss_config
@@ -174,7 +174,8 @@ def _check_embedding_provider():
             print(_C.bold_red("error:") + " fastembed is not installed\n", file=sys.stderr)
             print("LSS is configured to use local embeddings, but fastembed is missing.", file=sys.stderr)
             print("Install it:", file=sys.stderr)
-            print(f"  {_C.bold('pip install local-semantic-search[local]')}", file=sys.stderr)
+            _install_cmd = "pip install 'local-semantic-search[local]'"
+            print(f"  {_C.bold(_install_cmd)}", file=sys.stderr)
             print(f"\nOr switch to OpenAI embeddings:", file=sys.stderr)
             print(f"  {_C.bold('export OPENAI_API_KEY=sk-...')}", file=sys.stderr)
             return False
@@ -203,7 +204,8 @@ def _check_embedding_provider():
         print(f"Get a key at: {_C.cyan('https://platform.openai.com/api-keys')}", file=sys.stderr)
         if not has_fastembed:
             print(f"\nFor 100% offline operation, install local embeddings:", file=sys.stderr)
-            print(f"  {_C.bold('pip install local-semantic-search[local]')}", file=sys.stderr)
+            _install_cmd = "pip install 'local-semantic-search[local]'"
+            print(f"  {_C.bold(_install_cmd)}", file=sys.stderr)
         return False
     return True
 
@@ -402,8 +404,28 @@ def cmd_search(args) -> int:
                 print(_C.bold_red("error:") + f" not a file or directory: {path}", file=sys.stderr)
                 return 2
 
+        # Parse search filter flags
+        ext_include = getattr(args, "ext", None)
+        ext_exclude = getattr(args, "exclude_ext", None)
+        exclude_patterns = getattr(args, "exclude_pattern", None)
+
+        # Validate regex patterns early
+        if exclude_patterns:
+            import re as _re
+            for pat in exclude_patterns:
+                try:
+                    _re.compile(pat)
+                except _re.error as e:
+                    print(_C.bold_red("error:") + f" invalid regex pattern: {pat}", file=sys.stderr)
+                    print(f"  {e}", file=sys.stderr)
+                    return 2
+
         t0 = time.time()
-        batches = semantic_search(str(path), queries, indexed_only=no_index)
+        batches = semantic_search(
+            str(path), queries, indexed_only=no_index,
+            ext_include=ext_include, ext_exclude=ext_exclude,
+            exclude_patterns=exclude_patterns,
+        )
         dt = time.time() - t0
 
         # ── JSON output ──────────────────────────────────────────────────
@@ -1129,7 +1151,8 @@ def cmd_config(args) -> int:
             except ImportError:
                 print(_C.bold_red("error:") + " fastembed is not installed\n", file=sys.stderr)
                 print("Install it first:", file=sys.stderr)
-                print(f"  {_C.bold('pip install local-semantic-search[local]')}", file=sys.stderr)
+                _install_cmd = "pip install 'local-semantic-search[local]'"
+                print(f"  {_C.bold(_install_cmd)}", file=sys.stderr)
                 return 1
 
         cfg = lss_config.load_config()
@@ -1256,6 +1279,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help=argparse.SUPPRESS)
     p_s.add_argument("-y", "--yes", action="store_true",
                      help="skip confirmation prompt before indexing")
+    p_s.add_argument("-e", "--ext", action="append", default=None, metavar="EXT",
+                     help="only include files with this extension (repeatable, e.g. -e .py -e .ts)")
+    p_s.add_argument("-E", "--exclude-ext", action="append", default=None, metavar="EXT",
+                     help="exclude files with this extension (repeatable, e.g. -E .yaml -E .json)")
+    p_s.add_argument("-x", "--exclude-pattern", action="append", default=None, metavar="REGEX",
+                     help="exclude chunks matching regex (repeatable, e.g. -x '\\d{4}-\\d{2}-\\d{2}')")
     p_s.add_argument("--no-color", action="store_true", help="disable colors")
     p_s.add_argument("--debug", action="store_true", help="debug output")
     p_s.set_defaults(func=cmd_search)

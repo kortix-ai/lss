@@ -16,7 +16,7 @@ only-include = [
 
 [project]
 name = "local-semantic-search"
-version = "0.5.0"
+version = "0.5.1"
 description = "Local semantic search over your files — BM25 + embeddings (OpenAI or 100% offline via fastembed) with smart chunking, document extraction, and real-time file watching."
 authors = [{ name = "Kortix", email = "oss@kortix.so" }]
 license = { text = "Apache-2.0" }

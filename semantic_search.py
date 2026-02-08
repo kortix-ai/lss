@@ -576,12 +576,38 @@ def _has_factual_pattern(merged_text, query):
     return min(boost, 0.2)  # Cap boost
 
 # SEMANTIC SEARCH - Main interface
-def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed_only=False):
-    """Search for sentences in a file or folder"""
+def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed_only=False,
+                    ext_include=None, ext_exclude=None, exclude_patterns=None):
+    """Search for sentences in a file or folder.
+    
+    ext_include:       list of extensions to include (e.g. [".py", ".ts"]).
+                       If set, only files with these extensions are searched.
+    ext_exclude:       list of extensions to exclude (e.g. [".yaml"]).
+    exclude_patterns:  list of regex patterns. Chunks matching any pattern are
+                       removed from results (post-filter).
+    """
     from pathlib import Path
     
     if not sentences:
         return []
+    
+    # Normalize extension filters: ensure leading dot
+    if ext_include:
+        ext_include = [e if e.startswith(".") else f".{e}" for e in ext_include]
+    if ext_exclude:
+        ext_exclude = [e if e.startswith(".") else f".{e}" for e in ext_exclude]
+    # Apply exclude on top of include
+    if ext_include and ext_exclude:
+        ext_include = [e for e in ext_include if e not in ext_exclude]
+    
+    # Validate regex patterns early
+    compiled_patterns = []
+    if exclude_patterns:
+        for pat in exclude_patterns:
+            try:
+                compiled_patterns.append(re.compile(pat))
+            except re.error as e:
+                raise ValueError(f"Invalid regex pattern '{pat}': {e}")
     
     # Determine scope type
     path = Path(scope_path).resolve()
@@ -627,7 +653,11 @@ def semantic_search(scope_path, sentences, db_path="semantic_search.db", indexed
             unique_sentences.append(sent)
     
     for sentence in unique_sentences:
-        sentence_results = _search_single_sentence(sentence, file_uid, str(path), cur, con, lss_db_path)
+        sentence_results = _search_single_sentence(
+            sentence, file_uid, str(path), cur, con, lss_db_path,
+            ext_include=ext_include, ext_exclude=ext_exclude,
+            exclude_patterns=compiled_patterns,
+        )
         results.append(sentence_results)
     
     con.close()
@@ -701,8 +731,37 @@ def _compute_rank_correlation(bm25_ranks, embed_ranks):
     correlation = 1 - (6 * sum_d_sq) / (n * (n**2 - 1))
     return correlation
 
-def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=None):
-    """Search logic with PRF, adaptive budget, and speed optimizations"""
+def _ext_filter_sql(ext_include=None, ext_exclude=None):
+    """Build SQL WHERE fragments and params for extension filtering.
+    
+    Returns (sql_fragment, params_list).  sql_fragment is either "" or starts
+    with " AND ...".  fts.file_path is UNINDEXED so we can't use MATCH, but
+    plain LIKE works fine on it.
+    """
+    parts = []
+    params = []
+    if ext_include:
+        # OR together: file_path LIKE '%.py' OR file_path LIKE '%.ts'
+        likes = " OR ".join(["fts.file_path LIKE ?" for _ in ext_include])
+        parts.append(f"({likes})")
+        params.extend([f"%{e}" for e in ext_include])
+    if ext_exclude:
+        for e in ext_exclude:
+            parts.append("fts.file_path NOT LIKE ?")
+            params.append(f"%{e}")
+    if not parts:
+        return "", []
+    return " AND " + " AND ".join(parts), params
+
+
+def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=None,
+                            ext_include=None, ext_exclude=None, exclude_patterns=None):
+    """Search logic with PRF, adaptive budget, and speed optimizations.
+    
+    ext_include:      list of extensions (with dot) to include, or None.
+    ext_exclude:      list of extensions (with dot) to exclude, or None.
+    exclude_patterns: list of compiled regex patterns for content exclusion.
+    """
     from pathlib import Path
     
     t_all = time.time()
@@ -720,24 +779,27 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     keys = _keywords(q, max_terms=16, con=cur, df_map=df_map)
     main_query = _fts_or(keys)
     
+    # Build extension filter SQL (shared across initial + PRF queries)
+    ext_sql, ext_params = _ext_filter_sql(ext_include, ext_exclude)
+    
     rows = []
     if main_query:
         if file_uid is not None:
             # File scope - filter by file_uid with indexed_at
             rows = cur.execute(
-                """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, files.indexed_at 
+                f"""SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, files.indexed_at 
                    FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
-                   WHERE fts MATCH ? AND fts.file_uid = ? ORDER BY r LIMIT ?""",
-                (main_query, file_uid, K_SQL)
+                   WHERE fts MATCH ? AND fts.file_uid = ?{ext_sql} ORDER BY r LIMIT ?""",
+                [main_query, file_uid] + ext_params + [K_SQL]
             ).fetchall()
         else:
             # Directory scope - filter by file_path prefix with indexed_at
             path_prefix = str(Path(scope_path).resolve()) + "/"
             rows = cur.execute(
-                """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, fts.file_path, files.indexed_at 
+                f"""SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, fts.file_path, files.indexed_at 
                    FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
-                   WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?) ORDER BY r LIMIT ?""",
-                (main_query, scope_path, path_prefix + "%", K_SQL)
+                   WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?){ext_sql} ORDER BY r LIMIT ?""",
+                [main_query, scope_path, path_prefix + "%"] + ext_params + [K_SQL]
             ).fetchall()
     
     bm25_ms = round((time.time() - t0) * 1000, 2)
@@ -777,19 +839,19 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
                 if file_uid is not None:
                     # File scope with indexed_at
                     prf_rows = cur.execute(
-                        """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, files.indexed_at 
+                        f"""SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, files.indexed_at 
                            FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
-                           WHERE fts MATCH ? AND fts.file_uid = ? ORDER BY r LIMIT ?""",
-                        (expanded_query, file_uid, K_SQL2)
+                           WHERE fts MATCH ? AND fts.file_uid = ?{ext_sql} ORDER BY r LIMIT ?""",
+                        [expanded_query, file_uid] + ext_params + [K_SQL2]
                     ).fetchall()
                 else:
                     # Directory scope with indexed_at
                     path_prefix = str(Path(scope_path).resolve()) + "/"
                     prf_rows = cur.execute(
-                        """SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, fts.file_path, files.indexed_at 
+                        f"""SELECT fts.id, fts.text, bm25(fts) AS r, fts.text_hash, fts.file_path, files.indexed_at 
                            FROM fts LEFT JOIN files ON fts.file_uid = files.file_uid 
-                           WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?) ORDER BY r LIMIT ?""",
-                        (expanded_query, scope_path, path_prefix + "%", K_SQL2)
+                           WHERE fts MATCH ? AND (fts.file_path = ? OR fts.file_path LIKE ?){ext_sql} ORDER BY r LIMIT ?""",
+                        [expanded_query, scope_path, path_prefix + "%"] + ext_params + [K_SQL2]
                     ).fetchall()
                 
                 if prf_rows:
@@ -858,6 +920,9 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
                 "rank_stage": "S1",
                 "indexed_at": indexed_ats[j]
             })
+        # Post-filter: exclude chunks matching content regex patterns
+        if exclude_patterns and out:
+            out = [h for h in out if not any(p.search(h.get("snippet", "")) for p in exclude_patterns)]
         return out
 
     # Use adaptive budget for rerank pool, but cap at available candidates
@@ -948,6 +1013,9 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
                 "rank_stage": "S1_embed_fail",
                 "indexed_at": indexed_ats[j]
             })
+        # Post-filter: exclude chunks matching content regex patterns
+        if exclude_patterns and out:
+            out = [h for h in out if not any(p.search(h.get("snippet", "")) for p in exclude_patterns)]
         return out
     
     # RRF Fusion with ADAPTIVE embedding weight
@@ -1061,6 +1129,15 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
             "rank_stage": "S3_MMR" if vector_coverage >= 0.90 else "S3",
             "indexed_at": doc_indexed_at
         })
+    
+    # Post-filter: exclude chunks matching content regex patterns
+    if exclude_patterns and out:
+        filtered = []
+        for hit in out:
+            snippet = hit.get("snippet", "")
+            if not any(pat.search(snippet) for pat in exclude_patterns):
+                filtered.append(hit)
+        out = filtered
     
     cache_hits = len(ids) - len(need_idx) if need_idx else len(ids)
     cache_pct = round(100 * cache_hits / len(ids), 1) if ids else 0
