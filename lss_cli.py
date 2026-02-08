@@ -17,6 +17,7 @@ Management:
     lss watch add|remove|list      manage watched directories
     lss exclude add|remove|list    manage exclusion patterns
     lss sweep                      cleanup / maintenance
+    lss update                     check for updates and upgrade
     lss eval                       run search quality evaluation
     lss eval --json                evaluation results as JSON
 """
@@ -25,7 +26,7 @@ import argparse, sys, json, os, sqlite3, time
 from pathlib import Path
 from typing import List
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 # Set debug BEFORE importing other modules
 import lss_config
@@ -755,6 +756,109 @@ def cmd_version(_args) -> int:
     return 0
 
 
+# ── Update ───────────────────────────────────────────────────────────────────
+
+_PYPI_PACKAGE = "local-semantic-search"
+
+
+def _get_latest_pypi_version() -> str | None:
+    """Fetch latest version from PyPI. Returns None on failure."""
+    import urllib.request
+    try:
+        url = f"https://pypi.org/pypi/{_PYPI_PACKAGE}/json"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return data["info"]["version"]
+    except Exception:
+        return None
+
+
+def _detect_installer() -> str | None:
+    """Detect how lss was installed: pipx, uv, or pip."""
+    import shutil
+    import subprocess
+
+    # Check pipx first
+    if shutil.which("pipx"):
+        try:
+            out = subprocess.run(
+                ["pipx", "list", "--short"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if _PYPI_PACKAGE in out.stdout:
+                return "pipx"
+        except Exception:
+            pass
+
+    # Check uv
+    if shutil.which("uv"):
+        try:
+            out = subprocess.run(
+                ["uv", "tool", "list"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if _PYPI_PACKAGE in out.stdout or "lss" in out.stdout:
+                return "uv"
+        except Exception:
+            pass
+
+    # Fallback to pip
+    for pip_cmd in ["pip3", "pip"]:
+        if shutil.which(pip_cmd):
+            return pip_cmd
+
+    return None
+
+
+def cmd_update(args) -> int:
+    """Check for updates and upgrade lss."""
+    import subprocess
+
+    print(f"  {_C.dim('current')}  lss {__version__}")
+    print(f"  {_C.dim('checking')}  pypi.org/{_PYPI_PACKAGE} ...")
+
+    latest = _get_latest_pypi_version()
+    if latest is None:
+        print(_C.bold_red("error:") + " could not reach PyPI", file=sys.stderr)
+        return 1
+
+    print(f"  {_C.dim('latest')}   {latest}")
+    print()
+
+    if latest == __version__:
+        print(_C.green("Already up to date."))
+        return 0
+
+    installer = _detect_installer()
+    if installer is None:
+        print(_C.bold_red("error:") + " could not detect package manager (pipx/uv/pip)", file=sys.stderr)
+        print(f"  Run manually: pip install --upgrade {_PYPI_PACKAGE}", file=sys.stderr)
+        return 1
+
+    # Build upgrade command
+    if installer == "pipx":
+        cmd = ["pipx", "upgrade", _PYPI_PACKAGE]
+    elif installer == "uv":
+        cmd = ["uv", "tool", "upgrade", _PYPI_PACKAGE]
+    else:
+        cmd = [installer, "install", "--upgrade", _PYPI_PACKAGE]
+
+    print(f"  {_C.dim('upgrading via')}  {installer}")
+    print(f"  {_C.dim('running')}  {' '.join(cmd)}")
+    print()
+
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print()
+        print(_C.bold_red("error:") + f" upgrade failed (exit {result.returncode})", file=sys.stderr)
+        return 1
+
+    print()
+    print(_C.green(f"Updated lss {__version__} -> {latest}"))
+    return 0
+
+
 # ── Status ───────────────────────────────────────────────────────────────────
 
 def cmd_status(args) -> int:
@@ -939,7 +1043,7 @@ def cmd_exclude(args) -> int:
 
 _KNOWN_SUBCOMMANDS = {
     "search", "status", "watch", "exclude", "sweep",
-    "db-path", "ls", "index", "version", "eval",
+    "db-path", "ls", "index", "version", "eval", "update",
 }
 
 
@@ -1039,6 +1143,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_v = sub.add_parser("version", help="show version")
     p_v.set_defaults(func=cmd_version)
+
+    p_up = sub.add_parser("update", help="check for updates and upgrade lss")
+    p_up.add_argument("--debug", action="store_true")
+    p_up.set_defaults(func=cmd_update)
 
     return p
 

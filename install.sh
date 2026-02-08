@@ -58,10 +58,28 @@ detect_installer() {
   fi
 }
 
+# --- Check if lss is already installed ---
+is_installed() {
+  command -v lss &>/dev/null
+}
+
+get_current_version() {
+  lss --version 2>/dev/null | awk '{print $2}' || echo ""
+}
+
 # --- Main ---
 main() {
   printf "\n${W}  LSS — Local Semantic Search${N}\n"
   printf "  ${C}${REPO}${N}\n\n"
+
+  # Detect if this is an upgrade
+  local upgrading=false
+  local current_ver=""
+  if is_installed; then
+    current_ver=$(get_current_version)
+    upgrading=true
+    info "lss ${current_ver} is already installed — upgrading..."
+  fi
 
   info "Checking Python..."
   local py
@@ -77,18 +95,28 @@ main() {
   case "$installer" in
     pipx)
       ok "Found pipx"
-      info "Installing ${PACKAGE} via pipx..."
-      pipx install "$PACKAGE" || pipx upgrade "$PACKAGE"
+      if $upgrading; then
+        info "Upgrading ${PACKAGE} via pipx..."
+        pipx upgrade "$PACKAGE" 2>/dev/null || pipx install "$PACKAGE" --force
+      else
+        info "Installing ${PACKAGE} via pipx..."
+        pipx install "$PACKAGE"
+      fi
       ;;
     uv)
       ok "Found uv"
-      info "Installing ${PACKAGE} via uv tool..."
-      uv tool install "$PACKAGE" || uv tool upgrade "$PACKAGE"
+      if $upgrading; then
+        info "Upgrading ${PACKAGE} via uv tool..."
+        uv tool upgrade "$PACKAGE" 2>/dev/null || uv tool install "$PACKAGE" --force
+      else
+        info "Installing ${PACKAGE} via uv tool..."
+        uv tool install "$PACKAGE"
+      fi
       ;;
     pip3|pip)
       warn "pipx not found — using ${installer} (consider installing pipx for isolated environments)"
       info "Installing ${PACKAGE} via ${installer}..."
-      "$installer" install "$PACKAGE"
+      "$installer" install --upgrade "$PACKAGE"
       ;;
     none)
       warn "No pip/pipx/uv found. Installing pipx first..."
@@ -108,12 +136,19 @@ main() {
   if command -v lss &>/dev/null; then
     local installed_ver
     installed_ver=$(lss --version 2>/dev/null || echo "unknown")
-    ok "Installed: ${installed_ver}"
+
+    if $upgrading && [ -n "$current_ver" ]; then
+      ok "Updated: lss ${current_ver} -> ${installed_ver##* }"
+    else
+      ok "Installed: ${installed_ver}"
+    fi
+
     printf "\n"
     printf "  ${W}Get started:${N}\n"
     printf "    export OPENAI_API_KEY=\"sk-...\"   ${C}# add to ~/.zshrc or ~/.bashrc${N}\n"
     printf "    lss \"your search query\"           ${C}# search current directory${N}\n"
     printf "    lss \"query\" ~/Documents           ${C}# search a specific path${N}\n"
+    printf "    lss update                        ${C}# check for updates${N}\n"
     printf "    lss --help                        ${C}# see all commands${N}\n"
     printf "\n"
   else
