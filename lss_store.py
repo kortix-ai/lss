@@ -4,11 +4,78 @@ from collections import OrderedDict
 
 from lss_config import LSS_DIR, LSS_DB, VERSION_KEY
 import lss_config
+import lss_extract
 
-# ── Default exclusions ────────────────────────────────────────────────────────
+# ── File filtering ────────────────────────────────────────────────────────────
 #
-# These lists prevent indexing junk that wastes time, disk, and API calls.
-# Users can add more via `lss exclude add <pattern>`.
+# INCLUSION-BASED: Only index files with known text/code/doc extensions.
+# Unknown extensions are SKIPPED by default (no byte-level guessing).
+# Users can add more via `lss include add <ext>`.
+# Binary extensions are a fast-reject layer (never even stat the file).
+# Excluded directories are pruned during os.walk (never entered).
+
+# Extensions we KNOW contain indexable text or have dedicated extractors.
+INDEXED_EXTENSIONS = {
+    # Text / documentation
+    '.txt', '.md', '.markdown', '.rst', '.org', '.adoc', '.tex', '.rtf',
+    '.text', '.log',
+    # Code — Python
+    '.py', '.pyi', '.pyw',
+    # Code — JavaScript / TypeScript
+    '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.vue', '.svelte',
+    # Code — Systems
+    '.c', '.h', '.cpp', '.hpp', '.cc', '.hh', '.cxx', '.hxx',
+    '.go', '.rs', '.zig',
+    # Code — JVM
+    '.java', '.kt', '.kts', '.scala', '.clj', '.cljs', '.groovy', '.gradle',
+    # Code — .NET
+    '.cs', '.fs', '.vb', '.csproj', '.fsproj',
+    # Code — Scripting
+    '.rb', '.php', '.pl', '.pm', '.lua', '.r', '.R', '.jl',
+    # Code — Mobile / Apple
+    '.swift', '.m', '.mm',
+    # Code — Functional
+    '.hs', '.ml', '.mli', '.ex', '.exs', '.erl',
+    # Shell / scripts
+    '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+    # Web
+    '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    '.xml', '.xsl', '.xslt', '.svg',
+    # Data (text-based)
+    '.json', '.jsonl', '.ndjson',
+    '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.properties',
+    '.csv', '.tsv',
+    '.env.example', '.env.template',
+    # Query / schema
+    '.sql', '.graphql', '.gql', '.prisma',
+    # Config files
+    '.editorconfig', '.eslintrc', '.prettierrc', '.babelrc',
+    '.npmrc', '.yarnrc',
+    # Documents with dedicated extractors (lss_extract.py)
+    '.pdf', '.docx', '.xlsx', '.pptx', '.eml',
+    # Misc text
+    '.diff', '.patch',
+}
+
+# Well-known filenames WITHOUT extensions that we should index.
+KNOWN_EXTENSIONLESS = {
+    'Makefile', 'GNUmakefile', 'makefile',
+    'Dockerfile', 'Containerfile',
+    'Vagrantfile', 'Procfile', 'Brewfile',
+    'Gemfile', 'Rakefile', 'Guardfile',
+    'LICENSE', 'LICENCE', 'COPYING', 'NOTICE',
+    'README', 'CHANGELOG', 'CHANGES', 'HISTORY', 'AUTHORS', 'CONTRIBUTORS',
+    'INSTALL', 'TODO', 'HACKING',
+    '.gitignore', '.gitattributes', '.gitmodules',
+    '.dockerignore', '.editorconfig', '.eslintignore',
+    '.prettierignore', '.npmignore', '.slugignore',
+    '.flake8', '.pylintrc', '.rubocop.yml',
+    '.clang-format', '.clang-tidy',
+    'CMakeLists.txt',  # has extension but worth calling out
+    'go.mod', 'go.sum',
+    'requirements.txt', 'constraints.txt',
+    'setup.py', 'setup.cfg',
+}
 
 EXCLUDED_DIRS = {
     # Version control
@@ -77,9 +144,11 @@ BINARY_EXTENSIONS = {
     '.pyc', '.pyo', '.class', '.o', '.obj', '.so', '.dylib',
     '.dll', '.exe', '.bin', '.elf', '.wasm',
     '.a', '.lib', '.ko',
-    # Documents (binary formats)
-    '.pdf',  # we handle PDF separately via _extract_pdf_text
-    '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    # Documents (binary formats we CAN'T extract — formats we CAN extract
+    # are handled by lss_extract and NOT listed here)
+    '.doc',  # legacy Word (needs LibreOffice — too heavy)
+    '.ppt',  # legacy PowerPoint
+    '.xls',  # legacy Excel (openpyxl handles .xlsx only)
     '.odt', '.ods', '.odp', '.pages', '.numbers', '.key',
     # Fonts
     '.ttf', '.otf', '.woff', '.woff2', '.eot',
@@ -268,7 +337,8 @@ def _is_text_file(file_path):
         return False
     if size == 0 or size > MAX_FILE_SIZE:
         return False
-    if ext == '.pdf':
+    # Binary-format files with dedicated extractors
+    if ext in ('.pdf', '.docx', '.xlsx', '.pptx', '.eml'):
         return True
 
     try:
@@ -296,83 +366,13 @@ def _is_text_file(file_path):
 
 # ── Text extraction ──────────────────────────────────────────────────────────
 
-def _extract_pdf_text(file_path):
-    """Extract text from PDF files using PyPDF2 (lightweight, pure Python)"""
-    try:
-        import PyPDF2
-        text = ""
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            for page in reader.pages:
-                text += page.extract_text() + "\n"
-        return text.strip()
-    except ImportError:
-        raise RuntimeError("PDF support requires PyPDF2. Install with: pip install pypdf2")
-
 def _extract_text(file_path):
-    """Extract text from supported file types"""
-    path = Path(file_path)
-    ext = path.suffix.lower()
+    """Extract text from supported file types.
 
-    if ext == '.pdf':
-        return _extract_pdf_text(file_path)
-
-    try:
-        text = path.read_text(encoding='utf-8')
-    except UnicodeDecodeError:
-        for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
-            try:
-                text = path.read_text(encoding=encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            raise ValueError(f"Could not decode text from {file_path}")
-
-    if ext == '.json':
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return " ".join(str(v) for v in data.values() if isinstance(v, (str, int, float)))
-            elif isinstance(data, list):
-                return " ".join(str(item) for item in data if isinstance(item, (str, int, float)))
-            else:
-                return str(data)
-        except json.JSONDecodeError:
-            pass
-    elif ext == '.jsonl':
-        try:
-            texts = []
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                if 'text' in obj:
-                    texts.append(obj['text'])
-                elif 'title' in obj and 'text' in obj:
-                    texts.append(f"{obj['title']} {obj['text']}")
-                else:
-                    texts.append(" ".join(str(v) for v in obj.values() if isinstance(v, (str, int, float))))
-            return "\n".join(texts)
-        except json.JSONDecodeError:
-            pass
-
-    if ext == '.csv':
-        try:
-            import csv, io
-            csvfile = io.StringIO(text)
-            reader = csv.reader(csvfile)
-            rows = list(reader)
-            if rows:
-                result = " ".join(rows[0])
-                for row in rows[1:min(100, len(rows))]:
-                    result += " " + " ".join(row)
-                return result
-        except Exception:
-            pass
-
-    return text
+    Delegates to lss_extract.extract_text() which handles PDF, DOCX, XLSX,
+    PPTX, HTML, EML, JSON, CSV, and plain text with format-specific parsers.
+    """
+    return lss_extract.extract_text(str(file_path))
 
 def _normalize_text(text):
     """Normalize text"""
@@ -398,44 +398,228 @@ def _span_chunk(text, words_per_span=220, stride=200):
 
     return spans
 
-# ── File walking (os.walk with directory pruning) ────────────────────────────
+
+def _chunk_markdown(text, max_words=220, stride=200):
+    """Chunk markdown/rst by heading boundaries.
+
+    Splits on lines starting with # (markdown) or underline patterns (rst).
+    Each chunk includes the heading + its content.
+    Falls back to _span_chunk if no headings are found.
+    """
+    import re as _re
+
+    # Split on markdown headings (# ... or ## ... etc.)
+    # Also handles RST underline headings (===, ---, ~~~)
+    heading_pattern = _re.compile(
+        r'^(#{1,6}\s+.+)$|^(.+)\n([=\-~]{3,})$',
+        _re.MULTILINE
+    )
+
+    # Find all heading positions
+    matches = list(heading_pattern.finditer(text))
+    if not matches:
+        return _span_chunk(text, max_words, stride)
+
+    sections = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        section = text[start:end].strip()
+        if section:
+            sections.append(section)
+
+    # Include any preamble before the first heading
+    preamble = text[:matches[0].start()].strip()
+    if preamble:
+        sections.insert(0, preamble)
+
+    # If sections are too long, sub-chunk them with word-window
+    chunks = []
+    for section in sections:
+        words = section.split()
+        if len(words) <= max_words:
+            chunks.append(("markdown", section))
+        else:
+            # Sub-chunk long sections
+            for chunk_type, chunk_text in _span_chunk(section, max_words, stride):
+                chunks.append(("markdown", chunk_text))
+
+    return chunks if chunks else _span_chunk(text, max_words, stride)
+
+
+def _chunk_python(text, max_words=220, stride=200):
+    """Chunk Python code by function/class boundaries.
+
+    Uses regex-based splitting (not ast) to handle incomplete/invalid code.
+    Each chunk includes the def/class line + its body.
+    Falls back to _span_chunk if no definitions are found.
+    """
+    import re as _re
+
+    # Split on top-level def/class (lines starting with def or class, no indent)
+    # Also match methods (indented def) for large classes
+    defn_pattern = _re.compile(r'^((?:class|def)\s+\w+)', _re.MULTILINE)
+    matches = list(defn_pattern.finditer(text))
+
+    if not matches:
+        return _span_chunk(text, max_words, stride)
+
+    sections = []
+
+    # Include preamble (imports, constants) before first definition
+    preamble = text[:matches[0].start()].strip()
+    if preamble:
+        sections.append(preamble)
+
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        section = text[start:end].strip()
+        if section:
+            sections.append(section)
+
+    # Sub-chunk long sections
+    chunks = []
+    for section in sections:
+        words = section.split()
+        if len(words) <= max_words:
+            chunks.append(("python", section))
+        else:
+            for chunk_type, chunk_text in _span_chunk(section, max_words, stride):
+                chunks.append(("python", chunk_text))
+
+    return chunks if chunks else _span_chunk(text, max_words, stride)
+
+
+def _smart_chunk(text, file_ext, words_per_span=220, stride=200):
+    """Dispatch to format-specific chunkers based on file extension.
+
+    Args:
+        text: The extracted text to chunk.
+        file_ext: File extension (e.g., ".md", ".py", ".txt").
+        words_per_span: Max words per chunk (for word-window fallback).
+        stride: Word stride between chunks (for word-window fallback).
+
+    Returns:
+        List of (chunk_type, chunk_text) tuples.
+    """
+    if not text or not text.strip():
+        return []
+
+    ext = file_ext.lower()
+
+    # Markdown / RST — split on headings
+    if ext in ('.md', '.markdown', '.rst', '.adoc', '.org'):
+        return _chunk_markdown(text, words_per_span, stride)
+
+    # Python — split on def/class boundaries
+    if ext in ('.py', '.pyi', '.pyw'):
+        return _chunk_python(text, words_per_span, stride)
+
+    # Everything else — standard word-window chunking
+    return _span_chunk(text, words_per_span, stride)
+
+# ── .gitignore parsing ───────────────────────────────────────────────────────
+
+def _parse_gitignore(gitignore_path):
+    """Parse a .gitignore file into (file_patterns, dir_patterns) lists."""
+    file_patterns = []
+    dir_patterns = []
+    try:
+        text = Path(gitignore_path).read_text(encoding='utf-8', errors='replace')
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Negation patterns (!) are too complex — skip them
+            if line.startswith('!'):
+                continue
+            if line.endswith('/'):
+                # Directory pattern
+                dir_patterns.append(line.rstrip('/'))
+            else:
+                file_patterns.append(line)
+    except Exception:
+        pass
+    return file_patterns, dir_patterns
+
+# ── File walking (os.walk with inclusion-based filtering) ────────────────────
 
 def _walk_text_files(base_path, extra_exclude_patterns=None):
-    """Walk a directory tree, pruning excluded dirs IN-PLACE (never enters them).
+    """Walk a directory tree with INCLUSION-BASED filtering.
 
-    Uses os.walk instead of rglob — on a Desktop with 120K files and 117K in
-    node_modules, this is ~6x faster because pruned dirs are never traversed.
+    Strategy:
+    1. Prune excluded directories in-place (os.walk never enters them)
+    2. Parse .gitignore files in each directory for additional exclusions
+    3. Fast-reject files by BINARY_EXTENSIONS or EXCLUDED_FILES
+    4. Accept files with known INDEXED_EXTENSIONS or KNOWN_EXTENSIONLESS names
+    5. For unknown extensions: skip (no byte-level guessing)
+    6. Extensionless files: accept if name is in KNOWN_EXTENSIONLESS, else byte-check
 
-    Returns an iterator of Path objects (text files only).
+    Users can extend the allowlist via `lss include add <ext>`.
     """
     base = str(Path(base_path).resolve())
 
-    # Pre-compute user exclusion patterns (load config ONCE, not per-file)
-    cfg_patterns = list(extra_exclude_patterns or [])
+    # Pre-compute user config (load ONCE, not per-file)
     cfg = lss_config.load_config()
+    cfg_patterns = list(extra_exclude_patterns or [])
     cfg_patterns.extend(cfg.get("exclude_patterns", []))
 
-    # Split patterns into dir-name patterns and file-glob patterns
+    # User-added include extensions
+    user_include = set(cfg.get("include_extensions", []))
+
+    # Build combined set: default + user includes
+    include_exts = INDEXED_EXTENSIONS | user_include
+
+    # Split exclude patterns into dir-name patterns and file-glob patterns
     dir_excludes = set(EXCLUDED_DIRS)
     file_globs = []
     for pat in cfg_patterns:
         if '/' not in pat and '*' not in pat and '?' not in pat:
-            dir_excludes.add(pat)  # bare name → treat as dir exclusion too
+            dir_excludes.add(pat)
         file_globs.append(pat)
 
+    # Gitignore state: {dir_path: (file_patterns, dir_patterns)}
+    gitignore_stack = []
+
     for root, dirs, files in os.walk(base):
-        # Prune excluded directories in-place — os.walk won't descend into them
-        dirs[:] = [d for d in dirs if d not in dir_excludes]
+        # ── Parse .gitignore in this directory ──
+        gitignore_file = os.path.join(root, '.gitignore')
+        if os.path.isfile(gitignore_file):
+            gi_files, gi_dirs = _parse_gitignore(gitignore_file)
+            gitignore_stack.append((root, gi_files, gi_dirs))
+
+        # ── Prune excluded directories ──
+        # Combine hardcoded excludes + gitignore dir patterns
+        gi_dir_excludes = set()
+        for gi_root, _, gi_dirs_pats in gitignore_stack:
+            # Only apply gitignore dir patterns from ancestor directories
+            if root.startswith(gi_root):
+                gi_dir_excludes.update(gi_dirs_pats)
+
+        dirs[:] = [
+            d for d in dirs
+            if d not in dir_excludes and d not in gi_dir_excludes
+        ]
+
+        # ── Collect active gitignore file patterns for this directory ──
+        active_gi_file_patterns = []
+        for gi_root, gi_file_pats, _ in gitignore_stack:
+            if root.startswith(gi_root):
+                active_gi_file_patterns.extend(gi_file_pats)
 
         for name in files:
-            # Fast-path: name and extension checks (no I/O)
+            # 1. Fast-reject: excluded filenames
             if name in EXCLUDED_FILES:
                 continue
+
             ext = os.path.splitext(name)[1].lower()
+
+            # 2. Fast-reject: binary extensions
             if ext in BINARY_EXTENSIONS:
                 continue
 
-            # Check user-configured file glob patterns
+            # 3. Check user-configured file glob exclusion patterns
             if file_globs:
                 skip = False
                 for pat in file_globs:
@@ -445,9 +629,47 @@ def _walk_text_files(base_path, extra_exclude_patterns=None):
                 if skip:
                     continue
 
+            # 4. Check gitignore file patterns
+            if active_gi_file_patterns:
+                skip = False
+                for pat in active_gi_file_patterns:
+                    if fnmatch.fnmatch(name, pat):
+                        skip = True
+                        break
+                if skip:
+                    continue
+
+            # 5. Inclusion check: known extension OR known extensionless name
+            if ext:
+                # Has an extension — check against allowlist
+                if ext not in include_exts:
+                    continue  # Unknown extension → skip
+            else:
+                # No extension — check against known extensionless names
+                if name not in KNOWN_EXTENSIONLESS:
+                    # Unknown extensionless file — byte-check as fallback
+                    full = os.path.join(root, name)
+                    try:
+                        with open(full, 'rb') as f:
+                            chunk = f.read(8192)
+                        if not chunk or b'\0' in chunk:
+                            continue
+                        chunk.decode('utf-8')
+                    except Exception:
+                        continue
+                    # Passed byte-check, yield below
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError:
+                        continue
+                    if size == 0 or size > MAX_FILE_SIZE:
+                        continue
+                    yield Path(full)
+                    continue
+
             full = os.path.join(root, name)
 
-            # Size check (no open, just stat)
+            # 6. Size check (no open, just stat)
             try:
                 size = os.path.getsize(full)
             except OSError:
@@ -455,36 +677,7 @@ def _walk_text_files(base_path, extra_exclude_patterns=None):
             if size == 0 or size > MAX_FILE_SIZE:
                 continue
 
-            # PDF special case
-            if ext == '.pdf':
-                yield Path(full)
-                continue
-
-            # Slow-path: byte-level text detection
-            try:
-                with open(full, 'rb') as f:
-                    chunk = f.read(8192)
-                if not chunk:
-                    continue
-                if b'\0' in chunk:
-                    continue
-                try:
-                    chunk.decode('utf-8')
-                    yield Path(full)
-                    continue
-                except UnicodeDecodeError:
-                    pass
-                for enc in ('latin-1', 'cp1252', 'iso-8859-1'):
-                    try:
-                        chunk.decode(enc)
-                        ratio = sum(1 for b in chunk if 32 <= b <= 126 or b in (9, 10, 13)) / len(chunk)
-                        if ratio > 0.7:
-                            yield Path(full)
-                        break
-                    except UnicodeDecodeError:
-                        continue
-            except Exception:
-                continue
+            yield Path(full)
 
 # ── Core indexing API ────────────────────────────────────────────────────────
 
@@ -554,7 +747,7 @@ def _do_index(path, con=None):
 
         raw_text = _extract_text(path)
         text = _normalize_text(raw_text)
-        spans = _span_chunk(text)
+        spans = _smart_chunk(text, path.suffix)
 
         existing_hashes = set()
         if row:

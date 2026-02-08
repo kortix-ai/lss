@@ -12,9 +12,13 @@ Usage:
 
 Management:
     lss status                     show config, watched paths, DB stats
+    lss config show                show all configuration
+    lss config provider local      switch to local embeddings (offline)
+    lss config provider openai     switch to OpenAI embeddings
     lss index <path>               manually index a file
     lss ls                         list indexed files
     lss watch add|remove|list      manage watched directories
+    lss include add|remove|list    manage included file extensions
     lss exclude add|remove|list    manage exclusion patterns
     lss sweep                      cleanup / maintenance
     lss update                     check for updates and upgrade
@@ -26,7 +30,7 @@ import argparse, sys, json, os, sqlite3, time
 from pathlib import Path
 from typing import List
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 # Set debug BEFORE importing other modules
 import lss_config
@@ -155,16 +159,51 @@ def _read_queries(args) -> List[str]:
     return list(dict.fromkeys(qs))  # de-dupe, preserve order
 
 
-def _check_openai_key():
-    """Check if OPENAI_API_KEY is set, print helpful error if not."""
+def _check_embedding_provider():
+    """Check that the active embedding provider is usable.
+
+    Returns True if everything is OK, False otherwise (with helpful message).
+    """
+    provider = lss_config.EMBEDDING_PROVIDER
+
+    if provider == "local":
+        try:
+            import fastembed  # noqa: F401
+            return True
+        except ImportError:
+            print(_C.bold_red("error:") + " fastembed is not installed\n", file=sys.stderr)
+            print("LSS is configured to use local embeddings, but fastembed is missing.", file=sys.stderr)
+            print("Install it:", file=sys.stderr)
+            print(f"  {_C.bold('pip install local-semantic-search[local]')}", file=sys.stderr)
+            print(f"\nOr switch to OpenAI embeddings:", file=sys.stderr)
+            print(f"  {_C.bold('export OPENAI_API_KEY=sk-...')}", file=sys.stderr)
+            return False
+
+    # provider == "openai"
     key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not key:
+        # Check if fastembed is available as a hint
+        has_fastembed = False
+        try:
+            import fastembed  # noqa: F401
+            has_fastembed = True
+        except ImportError:
+            pass
+
         print(_C.bold_red("error:") + " OPENAI_API_KEY is not set\n", file=sys.stderr)
-        print("LSS uses OpenAI embeddings for semantic search.", file=sys.stderr)
-        print("Set your API key:", file=sys.stderr)
+        if has_fastembed:
+            print("You can use 100% local embeddings (no API key needed):", file=sys.stderr)
+            print(f"  {_C.bold('lss config provider local')}", file=sys.stderr)
+            print(f"\nOr set your OpenAI API key:", file=sys.stderr)
+        else:
+            print("LSS uses OpenAI embeddings for semantic search.", file=sys.stderr)
+            print("Set your API key:", file=sys.stderr)
         print(f"  {_C.bold('export OPENAI_API_KEY=sk-...')}", file=sys.stderr)
         print(f"\nOr add it to {_C.dim('~/.lss/.env')} or {_C.dim('~/.config/lss/.env')}", file=sys.stderr)
         print(f"Get a key at: {_C.cyan('https://platform.openai.com/api-keys')}", file=sys.stderr)
+        if not has_fastembed:
+            print(f"\nFor 100% offline operation, install local embeddings:", file=sys.stderr)
+            print(f"  {_C.bold('pip install local-semantic-search[local]')}", file=sys.stderr)
         return False
     return True
 
@@ -253,7 +292,7 @@ def cmd_search(args) -> int:
     from semantic_search import semantic_search
 
     # Check for API key early
-    if not _check_openai_key():
+    if not _check_embedding_provider():
         return 1
 
     # Resolve path and queries
@@ -274,8 +313,8 @@ def cmd_search(args) -> int:
                     if line and not line.startswith("#"):
                         queries.append(line)
 
-    # De-dupe
-    queries = list(dict.fromkeys(queries))
+    # De-dupe and filter empty/whitespace-only queries
+    queries = list(dict.fromkeys(q for q in queries if q and q.strip()))
 
     if not queries:
         print(_C.bold_red("error:") + " no query provided\n", file=sys.stderr)
@@ -463,7 +502,7 @@ def cmd_search(args) -> int:
     except ValueError as e:
         msg = str(e)
         if "OPENAI_API_KEY" in msg:
-            _check_openai_key()
+            _check_embedding_provider()
             return 1
         print(_C.bold_red("error:") + f" {e}", file=sys.stderr)
         return 2
@@ -660,7 +699,7 @@ def cmd_eval(args) -> int:
             print("Install with: pip install 'lss[dev]'", file=sys.stderr)
             return 2
 
-        if not _check_openai_key():
+        if not _check_embedding_provider():
             return 1
 
         # Ensure the evaluation package is importable
@@ -898,6 +937,14 @@ def cmd_status(args) -> int:
         print(f"  {_C.dim('watched paths: none')}")
         print(f"    {_C.dim('add with:')} lss watch add ~/Documents")
 
+    # Include extensions
+    user_includes = cfg.get("include_extensions", [])
+    if user_includes:
+        print()
+        print(f"  {_C.bold('custom extensions')} ({len(user_includes)}):")
+        for ext in sorted(user_includes):
+            print(f"    {_C.cyan(ext)}")
+
     # Exclusion patterns
     excludes = cfg.get("exclude_patterns", [])
     print()
@@ -908,13 +955,24 @@ def cmd_status(args) -> int:
     else:
         print(f"  {_C.dim('exclusion patterns: none')}")
 
-    # API key status
-    has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    # Embedding provider
+    provider = lss_config.EMBEDDING_PROVIDER
+    model, dim = lss_config._provider_model_dim()
     print()
-    if has_key:
-        print(f"  {_C.dim('api key')}      {_C.green('set')}")
+    if provider == "local":
+        print(f"  {_C.dim('provider')}     {_C.green('local')}  {_C.dim('(100% offline)')}")
     else:
-        print(f"  {_C.dim('api key')}      {_C.yellow('not set')}  {_C.dim('(required for search)')}")
+        print(f"  {_C.dim('provider')}     {_C.cyan('openai')}")
+    print(f"  {_C.dim('model')}        {model}")
+    print(f"  {_C.dim('dimensions')}   {dim}")
+
+    # API key status (only relevant for OpenAI provider)
+    if provider == "openai":
+        has_key = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+        if has_key:
+            print(f"  {_C.dim('api key')}      {_C.green('set')}")
+        else:
+            print(f"  {_C.dim('api key')}      {_C.yellow('not set')}  {_C.dim('(required for openai provider)')}")
 
     # DB stats
     if db_exists:
@@ -1039,10 +1097,135 @@ def cmd_exclude(args) -> int:
     return 2
 
 
+def cmd_config(args) -> int:
+    """View or set LSS configuration."""
+    action = args.config_action
+
+    if action == "show":
+        cfg = lss_config.load_config()
+        provider = lss_config.EMBEDDING_PROVIDER
+        model, dim = lss_config._provider_model_dim()
+
+        print(_C.bold("lss configuration"))
+        print()
+        print(f"  {_C.dim('provider')}           {_C.bold(provider)}")
+        print(f"  {_C.dim('model')}              {model}")
+        print(f"  {_C.dim('dimensions')}         {dim}")
+        print(f"  {_C.dim('watch paths')}        {len(cfg.get('watch_paths', []))}")
+        print(f"  {_C.dim('exclude patterns')}   {len(cfg.get('exclude_patterns', []))}")
+        print(f"  {_C.dim('custom extensions')}  {len(cfg.get('include_extensions', []))}")
+        return 0
+
+    if action == "provider":
+        value = args.value
+        if value not in ("openai", "local"):
+            print(_C.bold_red("error:") + f" unknown provider: {value}", file=sys.stderr)
+            print(f"  Valid providers: {_C.bold('openai')}, {_C.bold('local')}", file=sys.stderr)
+            return 2
+
+        if value == "local":
+            try:
+                import fastembed  # noqa: F401
+            except ImportError:
+                print(_C.bold_red("error:") + " fastembed is not installed\n", file=sys.stderr)
+                print("Install it first:", file=sys.stderr)
+                print(f"  {_C.bold('pip install local-semantic-search[local]')}", file=sys.stderr)
+                return 1
+
+        cfg = lss_config.load_config()
+        old_provider = cfg.get("embedding_provider", "")
+        cfg["embedding_provider"] = value
+        lss_config.save_config(cfg)
+
+        # Update runtime state
+        lss_config.EMBEDDING_PROVIDER = value
+        model, dim = lss_config._provider_model_dim()
+
+        print(f"  {_C.dim('provider')}  {_C.bold(value)}")
+        print(f"  {_C.dim('model')}     {model}")
+        print(f"  {_C.dim('dimensions')} {dim}")
+
+        if old_provider and old_provider != value:
+            print()
+            print(_C.yellow("  Note: switching providers changes embedding dimensions."))
+            print(_C.yellow("  Existing embeddings will be re-computed on next search."))
+            print(_C.dim("  BM25 index is not affected."))
+        return 0
+
+    return 2
+
+
+def cmd_include(args) -> int:
+    """Manage user-added include extensions (supplements INDEXED_EXTENSIONS)."""
+    from lss_store import INDEXED_EXTENSIONS
+
+    cfg = lss_config.load_config()
+    action = args.include_action
+
+    if action == "list":
+        user_exts = cfg.get("include_extensions", [])
+        builtin_count = len(INDEXED_EXTENSIONS)
+        print(f"  {_C.bold('built-in extensions')}: {builtin_count}")
+        if user_exts:
+            print(f"  {_C.bold('custom extensions')} ({len(user_exts)}):")
+            for ext in sorted(user_exts):
+                print(f"    {_C.cyan(ext)}")
+        else:
+            print(f"  {_C.dim('no custom extensions added')}")
+            print(f"    {_C.dim('add with:')} lss include add .ext")
+        return 0
+
+    if action == "add":
+        ext = args.extension
+        # Normalise: ensure leading dot
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        ext = ext.lower()
+
+        # Check if already built-in
+        if ext in INDEXED_EXTENSIONS:
+            user_exts = cfg.get("include_extensions", [])
+            if ext in user_exts:
+                print(f"Already included: {_C.cyan(ext)} (also built-in)")
+            else:
+                print(f"Already included: {_C.cyan(ext)} (built-in)")
+            return 0
+
+        user_exts = cfg.get("include_extensions", [])
+        if ext in user_exts:
+            print(f"Already included: {_C.cyan(ext)}")
+            return 0
+
+        user_exts.append(ext)
+        cfg["include_extensions"] = user_exts
+        lss_config.save_config(cfg)
+        print(f"Added: {_C.cyan(ext)}")
+        print(_C.dim(f"  Files with this extension will now be indexed"))
+        return 0
+
+    if action == "remove":
+        ext = args.extension
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        ext = ext.lower()
+
+        user_exts = cfg.get("include_extensions", [])
+        if ext not in user_exts:
+            print(f"Not in custom includes: {ext}")
+            return 1
+        user_exts.remove(ext)
+        cfg["include_extensions"] = user_exts
+        lss_config.save_config(cfg)
+        print(f"Removed: {ext}")
+        return 0
+
+    return 2
+
+
 # ── Parser ───────────────────────────────────────────────────────────────────
 
 _KNOWN_SUBCOMMANDS = {
-    "search", "status", "watch", "exclude", "sweep",
+    "search", "status", "config", "watch", "include", "exclude", "sweep",
     "db-path", "ls", "index", "version", "eval", "update",
 }
 
@@ -1082,6 +1265,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_st.add_argument("--debug", action="store_true")
     p_st.set_defaults(func=cmd_status)
 
+    # ── config ──
+    p_cfg = sub.add_parser("config", help="view or set configuration")
+    p_cfg_sub = p_cfg.add_subparsers(dest="config_action", required=True)
+    p_cfg_sub.add_parser("show", help="show all configuration")
+    p_cfg_provider = p_cfg_sub.add_parser("provider", help="set embedding provider (openai or local)")
+    p_cfg_provider.add_argument("value", help="provider name: openai or local")
+    p_cfg.add_argument("--debug", action="store_true")
+    p_cfg.set_defaults(func=cmd_config)
+
     # ── watch ──
     p_w = sub.add_parser("watch", help="manage watched directories")
     p_w_sub = p_w.add_subparsers(dest="watch_action", required=True)
@@ -1092,6 +1284,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_w_rm.add_argument("path", help="directory to stop watching")
     p_w.add_argument("--debug", action="store_true")
     p_w.set_defaults(func=cmd_watch)
+
+    # ── include ──
+    p_i = sub.add_parser("include", help="manage included file extensions")
+    p_i_sub = p_i.add_subparsers(dest="include_action", required=True)
+    p_i_sub.add_parser("list", help="list included extensions")
+    p_i_add = p_i_sub.add_parser("add", help="add a file extension to index")
+    p_i_add.add_argument("extension", help="file extension (e.g. .xyz or xyz)")
+    p_i_rm = p_i_sub.add_parser("remove", help="remove a custom extension")
+    p_i_rm.add_argument("extension", help="extension to remove")
+    p_i.add_argument("--debug", action="store_true")
+    p_i.set_defaults(func=cmd_include)
 
     # ── exclude ──
     p_e = sub.add_parser("exclude", help="manage exclusion patterns")

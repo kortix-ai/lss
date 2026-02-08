@@ -1,7 +1,6 @@
 import os, re, time, sqlite3, json, numpy as np, hashlib, unicodedata, logging
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from openai import OpenAI
 
 log = logging.getLogger("lss.search")
 
@@ -332,6 +331,20 @@ def _text_hash(text):
 
 # DB & OPENAI - Dynamic connection
 _client = None
+_local_model = None  # fastembed TextEmbedding instance (lazy-loaded)
+
+# Current provider — read once from lss_config at import time, but can be
+# refreshed via _refresh_provider() after config changes.
+EMBED_PROVIDER = lss_config.EMBEDDING_PROVIDER
+EMBED_MODEL, EMBED_DIM = lss_config._provider_model_dim()
+
+
+def _refresh_provider():
+    """Re-read provider from lss_config (call after config changes)."""
+    global EMBED_PROVIDER, EMBED_MODEL, EMBED_DIM
+    EMBED_PROVIDER = lss_config.EMBEDDING_PROVIDER
+    EMBED_MODEL, EMBED_DIM = lss_config._provider_model_dim()
+
 
 def _get_db_connection(db_path=None):
     if db_path is None:
@@ -345,15 +358,45 @@ def _get_db_connection(db_path=None):
     return con
 
 def _cli():
+    """Lazy-init OpenAI client (only used when provider == 'openai')."""
     global _client
     if _client is None:
+        from openai import OpenAI
         api_key = os.getenv('OPENAI_API_KEY', '').strip()
         if not api_key:
-            raise ValueError("OPENAI_API_KEY not set (required for search operations)")
+            raise ValueError("OPENAI_API_KEY not set (required for OpenAI embedding provider)")
         _client = OpenAI()
     return _client
 
-def _oai_embed(texts, db_path=None):  # SAME as search_module
+
+def _local_embed(texts):
+    """Embed texts using fastembed (local, offline, no API key needed).
+
+    Uses BAAI/bge-small-en-v1.5 (384d) by default.
+    Model is downloaded automatically on first use (~125MB).
+    Returns np.ndarray of shape (len(texts), LOCAL_DIM) or None on error.
+    """
+    global _local_model
+    if not texts:
+        return None
+    try:
+        if _local_model is None:
+            from fastembed import TextEmbedding
+            _local_model = TextEmbedding(model_name=lss_config.LOCAL_MODEL)
+        embeddings = list(_local_model.embed(texts))
+        V = np.array(embeddings, dtype=np.float32)
+        V /= (np.linalg.norm(V, axis=1, keepdims=True) + 1e-9)
+        return V
+    except ImportError:
+        log.error("fastembed not installed. Install with: pip install 'local-semantic-search[local]'")
+        return None
+    except Exception as e:
+        log.error("Local embedding failed: %s", e)
+        return None
+
+
+def _oai_embed(texts, db_path=None):
+    """Embed texts using OpenAI API."""
     if not texts:
         return None
         
@@ -410,6 +453,17 @@ def _oai_embed(texts, db_path=None):  # SAME as search_module
     V = np.asarray([d.embedding for d in r.data], dtype=np.float32)
     V /= (np.linalg.norm(V, axis=1, keepdims=True) + 1e-9)
     return V
+
+
+def _embed(texts, db_path=None):
+    """Provider-agnostic embedding entry point.
+
+    Dispatches to _oai_embed() or _local_embed() based on EMBED_PROVIDER.
+    Returns np.ndarray of shape (len(texts), dim) or None.
+    """
+    if EMBED_PROVIDER == "local":
+        return _local_embed(texts)
+    return _oai_embed(texts, db_path=db_path)
 
 def _adaptive_budget(scores, default=80):
     if len(scores) < 10: return min(len(scores), default)
@@ -830,14 +884,14 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
         placeholders = ','.join(['?' for _ in text_hashes])
         cache_rows = cache_con.execute(
             f"SELECT text_hash, vector FROM embeddings WHERE text_hash IN ({placeholders}) AND model=? AND dim=? AND version=?",
-            text_hashes + [OPENAI_MODEL, OPENAI_DIM, version]
+            text_hashes + [EMBED_MODEL, EMBED_DIM, version]
         ).fetchall()
         cache_map = {row[0]: np.frombuffer(row[1], dtype=np.float32) for row in cache_rows}
         
         for i, (text_hash, embed_text) in enumerate(zip(text_hashes, embed_texts)):
             cached_v = cache_map.get(text_hash)
             if cached_v is None:
-                cached_v = OAI_D_CACHE.get(("d", text_hash, OPENAI_MODEL, OPENAI_DIM))
+                cached_v = OAI_D_CACHE.get(("d", text_hash, EMBED_MODEL, EMBED_DIM))
             
             if cached_v is not None:
                 cache_map[text_hash] = cached_v  # ensure it's in cache_map for query dot product
@@ -848,7 +902,7 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     
     # SINGLE combined embedding call: [query] + need_texts  
     embed_input = [q] + need_texts
-    V = _oai_embed(embed_input) if embed_input else None
+    V = _embed(embed_input) if embed_input else None
     
     if V is not None:
         qv = V[0]  # query vector
@@ -859,8 +913,8 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
             for j, (i, text_hash) in enumerate(zip(need_idx, need_hashes)):
                 dv = V[1 + j]  # doc vectors start at index 1
                 cache_map[text_hash] = dv
-                OAI_D_CACHE.put(("d", text_hash, OPENAI_MODEL, OPENAI_DIM), dv)
-                new_cache_data.append((text_hash, OPENAI_MODEL, OPENAI_DIM, version, dv.tobytes(), time.time()))
+                OAI_D_CACHE.put(("d", text_hash, EMBED_MODEL, EMBED_DIM), dv)
+                new_cache_data.append((text_hash, EMBED_MODEL, EMBED_DIM, version, dv.tobytes(), time.time()))
             
             # Single executemany + commit for all new vectors.
             # Best-effort: if DB is locked (e.g. by lss-sync), skip caching —
@@ -1099,14 +1153,14 @@ def _search_components(scope_path, query, mode="hybrid"):
         placeholders = ','.join(['?' for _ in text_hashes])
         cache_rows = con.execute(
             f"SELECT text_hash, vector FROM embeddings WHERE text_hash IN ({placeholders}) AND model=? AND dim=? AND version=?",
-            text_hashes + [OPENAI_MODEL, OPENAI_DIM, version]
+            text_hashes + [EMBED_MODEL, EMBED_DIM, version]
         ).fetchall()
         cache_map = {row[0]: np.frombuffer(row[1], dtype=np.float32) for row in cache_rows}
 
         for i, (text_hash, embed_text) in enumerate(zip(text_hashes, texts)):
             cached_v = cache_map.get(text_hash)
             if cached_v is None:
-                cached_v = OAI_D_CACHE.get(("d", text_hash, OPENAI_MODEL, OPENAI_DIM))
+                cached_v = OAI_D_CACHE.get(("d", text_hash, EMBED_MODEL, EMBED_DIM))
             if cached_v is not None:
                 cache_map[text_hash] = cached_v
             else:
@@ -1117,14 +1171,14 @@ def _search_components(scope_path, query, mode="hybrid"):
         cache_map = {}
 
     embed_input = [query] + need_texts
-    V = _oai_embed(embed_input) if embed_input else None
+    V = _embed(embed_input) if embed_input else None
 
     if V is not None:
         qv = V[0]
         for j, (i, text_hash) in enumerate(zip(need_idx, need_hashes)):
             dv = V[1 + j]
             cache_map[text_hash] = dv
-            OAI_D_CACHE.put(("d", text_hash, OPENAI_MODEL, OPENAI_DIM), dv)
+            OAI_D_CACHE.put(("d", text_hash, EMBED_MODEL, EMBED_DIM), dv)
 
         for i, text_hash in enumerate(text_hashes):
             dv = cache_map.get(text_hash)

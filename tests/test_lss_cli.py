@@ -118,3 +118,109 @@ def test_cli_implicit_search(sample_dir, capsys):
     """'lss <query> <path>' should work without 'search' subcommand."""
     rc = main(["deployment", str(sample_dir)])
     assert rc == 0
+
+
+# ── include ──────────────────────────────────────────────────────────────────
+
+
+class TestIncludeCLI:
+    """Tests for 'lss include add|remove|list'."""
+
+    def test_include_list_empty(self, capsys):
+        """'lss include list' with no custom extensions should show empty state."""
+        rc = main(["include", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no custom" in out.lower() or "No custom" in out
+
+    def test_include_add(self, capsys):
+        """'lss include add .xyz' should add the extension."""
+        rc = main(["include", "add", ".xyz"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert ".xyz" in out
+
+    def test_include_add_normalises_dot(self, capsys):
+        """'lss include add xyz' (no dot) should normalise to '.xyz'."""
+        rc = main(["include", "add", "xyz"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert ".xyz" in out
+
+    def test_include_add_duplicate(self, capsys):
+        """Adding the same extension twice should say 'already'."""
+        main(["include", "add", ".abc"])
+        capsys.readouterr()  # discard first output
+        rc = main(["include", "add", ".abc"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "already" in out.lower()
+
+    def test_include_add_builtin_warns(self, capsys):
+        """Adding an extension that's already built-in should say so."""
+        rc = main(["include", "add", ".py"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "already" in out.lower() or "built-in" in out.lower()
+
+    def test_include_list_after_add(self, capsys):
+        """After adding extensions, 'lss include list' should show them."""
+        main(["include", "add", ".xyz"])
+        main(["include", "add", ".abc"])
+        capsys.readouterr()  # discard
+        rc = main(["include", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert ".xyz" in out
+        assert ".abc" in out
+
+    def test_include_remove(self, capsys):
+        """'lss include remove .xyz' should remove a previously added ext."""
+        main(["include", "add", ".xyz"])
+        capsys.readouterr()  # discard
+        rc = main(["include", "remove", ".xyz"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert ".xyz" in out
+
+    def test_include_remove_not_found(self, capsys):
+        """Removing an extension not in the list should fail."""
+        rc = main(["include", "remove", ".nope"])
+        assert rc == 1
+
+    def test_include_list_shows_builtin_count(self, capsys):
+        """'lss include list' should mention the count of built-in extensions."""
+        rc = main(["include", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "built-in" in out.lower()
+
+    def test_include_persists_to_config(self, isolated_lss_dir):
+        """Added extensions should persist in config.json."""
+        import lss_config
+        main(["include", "add", ".xyz"])
+        cfg = lss_config.load_config()
+        assert ".xyz" in cfg.get("include_extensions", [])
+
+
+# ── exclude ──────────────────────────────────────────────────────────────────
+
+
+class TestExcludeCLI:
+    """Smoke tests for 'lss exclude add|remove|list'."""
+
+    def test_exclude_list_empty(self, capsys):
+        rc = main(["exclude", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "no exclusion" in out.lower() or "No exclusion" in out
+
+    def test_exclude_add_and_remove(self, capsys):
+        rc = main(["exclude", "add", "*.log"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "*.log" in out
+
+        capsys.readouterr()
+        rc = main(["exclude", "remove", "*.log"])
+        assert rc == 0
