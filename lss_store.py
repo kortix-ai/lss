@@ -232,6 +232,16 @@ def _content_sig(file_path):
     hasher.update(first + middle + last + str(size).encode())
     return hasher.hexdigest()
 
+
+def _path_uid(resolved_path):
+    """Generate a unique file_uid from the resolved absolute path.
+
+    Uses a hash of the path so that different files with the same content
+    get distinct file_uid values (the old content-based uid caused
+    INSERT OR REPLACE collisions — only one path survived per content hash).
+    """
+    return "f_" + hashlib.md5(str(resolved_path).encode('utf-8')).hexdigest()
+
 def _text_hash(text):
     """Hash for text chunks - 16-byte binary MD5 for space efficiency"""
     return hashlib.md5(text.encode('utf-8')).digest()
@@ -712,7 +722,7 @@ def _do_index(path, con=None):
         stat = path.stat()
         size, mtime = stat.st_size, stat.st_mtime
         content_sig = _content_sig(path)
-        file_uid = f"f_{content_sig}"
+        file_uid = _path_uid(path)
 
         row = cur.execute(
             "SELECT content_sig, version FROM files WHERE file_uid = ?",
@@ -720,7 +730,13 @@ def _do_index(path, con=None):
         ).fetchone()
 
         if row and row[0] == content_sig and row[1] == VERSION_KEY:
-            cur.execute("UPDATE files SET path = ? WHERE file_uid = ?", (str(path), file_uid))
+            # Content unchanged — update mtime/size in case the inode was
+            # touched (e.g. git checkout, cp --preserve) so that the fast
+            # path+size+mtime lookup in discover_files keeps matching.
+            cur.execute(
+                "UPDATE files SET path = ?, size = ?, mtime = ? WHERE file_uid = ?",
+                (str(path), size, mtime, file_uid),
+            )
             if own_con:
                 con.commit()
             _cache_put(_get_file_cache_key(path), file_uid)

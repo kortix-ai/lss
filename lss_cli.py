@@ -1269,8 +1269,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="path to search (default: current directory)")
     p_s.add_argument("-Q", "--qfile",
                      help="file with one query per line, or '-' for stdin")
-    p_s.add_argument("-k", "--limit", type=int, default=5,
-                     help="max results per query (default: 5)")
+    p_s.add_argument("-k", "--limit", type=int, default=10,
+                     help="max results per query (default: 10)")
     p_s.add_argument("--json", action="store_true", help="JSON output")
     p_s.add_argument("--no-index", action="store_true",
                      help="skip auto-indexing, only search already-indexed files")
