@@ -99,19 +99,41 @@ LSS_PROVIDER=openai lss eval        # force OpenAI provider
 
 ---
 
-## 2. Hardware Considerations
+## 2. Hardware-Constrained Benchmarks
 
-The golden set evaluation was run on an Apple M-series Mac (arm64). Results may vary on different hardware:
+To verify that local embedding quality doesn't degrade on weaker hardware, we ran `lss eval` inside Docker containers with CPU and RAM limits via `docker run --cpus=N --memory=Xg`.
 
-| Factor | Impact on local embeddings | Impact on OpenAI |
-|--------|---------------------------|------------------|
-| **CPU speed** | Direct — fastembed inference time scales with CPU | None — inference runs on OpenAI's servers |
-| **RAM** | fastembed model needs ~125 MB resident | Minimal |
-| **Network latency** | None — fully local | Direct — API round-trip dominates |
-| **Container / VM** | May be slower if CPU is throttled | Unaffected |
-| **ARM vs x86** | fastembed uses ONNX Runtime, optimized for both | Unaffected |
+### Results — Local Provider Across Hardware Profiles
 
-**Quality** should be identical across hardware — the same model weights produce the same vectors. Only **latency** varies. If you're running in a resource-constrained container, benchmark with `lss eval` to verify latency is acceptable for your use case.
+```
+Profile               NDCG@10   MRR@10   MAP@10   Hybrid ms   Embed ms
+──────────────────────────────────────────────────────────────────────────
+Mac bare metal          0.911    1.000    0.834         812       3213
+Docker 2cpu / 2GB       0.910    1.000    0.831        1886      39558
+Docker 1cpu / 1GB       0.910    1.000    0.831        2897      55253
+Docker 1cpu / 512MB     OOM      —        —             —          —
+```
+
+**Test environment:** Apple M-series (arm64), Docker Desktop with cgroup limits.
+
+### Key findings
+
+- **Quality is identical across all profiles.** NDCG@10 varies by ±0.001 (noise). Same model weights = same vectors = same ranking. Hardware does not affect search quality.
+- **Latency scales with CPU.** 1-CPU container is ~3.5x slower than bare metal on hybrid search. 2-CPU is ~2.3x slower. BM25 (no embeddings) is fast everywhere (~40-125ms).
+- **512MB RAM is insufficient.** fastembed model (~125MB) + ONNX Runtime + Python overhead exceeds 512MB. **Minimum 1GB RAM required for local embeddings.**
+- **Embedding-only latency is worst-case.** 55s for 40 queries on 1-CPU is ~1.4s/query cold. After caching, subsequent searches are instant.
+
+### Reproduce
+
+```bash
+# Build the eval image (one-time)
+docker build -t lss-eval -f tests/eval_docker/Dockerfile .
+
+# Run under different constraints
+docker run --rm --cpus=1 --memory=1g -e LSS_PROVIDER=local lss-eval python -m lss_cli eval
+docker run --rm --cpus=2 --memory=2g -e LSS_PROVIDER=local lss-eval python -m lss_cli eval
+docker run --rm --cpus=4 --memory=4g -e LSS_PROVIDER=local lss-eval python -m lss_cli eval
+```
 
 ---
 
@@ -212,7 +234,8 @@ BM25 (Anserini/Lucene)      —       —       0.665       0.325
 - **BEIR scores are pre-custom-BM25** — the SciFact and NFCorpus numbers above were measured before v0.4.0's custom BM25 re-scoring. Re-running should improve BM25-only and potentially hybrid scores.
 - **256-dim vectors (OpenAI)** — trading some embedding precision for speed and storage. Bumping to 512 or 1536 dims would likely improve embedding-only scores at the cost of larger DB and slower search.
 - **BEIR with local provider** — not yet benchmarked. The golden set shows near-parity, but larger domain-specific corpora may show bigger gaps. Contributions welcome.
-- **Hardware-dependent latency** — local embedding latency depends on CPU. The 8x speedup over OpenAI was measured on an Apple M-series Mac. On a slow VM or throttled container, local may be slower than the OpenAI cold path.
+- **Hardware-dependent latency** — local embedding latency depends on CPU. On bare metal (M-series Mac) local is 8x faster than OpenAI. On a 1-CPU container, local hybrid takes ~2.9s vs OpenAI's ~6.5s — still faster, but the gap narrows. See Section 2 for measured profiles.
+- **Minimum 1GB RAM for local embeddings** — fastembed + ONNX Runtime + model weights need ~500-700MB. Containers with 512MB RAM will OOM during model loading.
 
 ---
 
