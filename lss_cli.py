@@ -30,7 +30,7 @@ import argparse, sys, json, os, sqlite3, time
 from pathlib import Path
 from typing import List
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 # Set debug BEFORE importing other modules
 import lss_config
