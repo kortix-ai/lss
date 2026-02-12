@@ -64,8 +64,83 @@ IGNORE_EXTENSIONS = {
 IGNORE_DIRS = {
     "__pycache__", ".git", ".svn", ".hg", "node_modules",
     ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
-    "dist", "build", ".eggs",
+    "dist", "build", ".eggs", ".cache",
 }
+
+BROWSER_CACHE_DIR_MARKERS = {
+    "cache", "cache_data", "code cache", "gpucache",
+    "shadercache", "grshadercache", "graphitedawncache",
+}
+
+BROWSER_DIR_MARKERS = {
+    "chromium", "google-chrome", "chrome", "brave", "edge", "msedge", "electron",
+}
+
+
+def _is_browser_cache_path(path: Path) -> bool:
+    """Return True if path looks like browser cache churn."""
+    parts_lower = {part.lower() for part in path.parts}
+    if not (parts_lower & BROWSER_DIR_MARKERS):
+        return False
+    return bool(parts_lower & BROWSER_CACHE_DIR_MARKERS)
+
+
+def _matches_exclude_pattern(path: Path, pattern: str) -> bool:
+    """Evaluate one exclude pattern against a path."""
+    if "*" in pattern:
+        return fnmatch.fnmatch(path.name, pattern)
+    if "/" in pattern:
+        return pattern in str(path)
+    return pattern in path.parts
+
+
+def _should_ignore_path(
+    path: str | bytes,
+    watch_paths: list[str],
+    exclude_patterns: list[str] | None = None,
+    max_depth: int | None = None,
+) -> bool:
+    """Shared path-ignore logic for handler + indexer."""
+    p = Path(os.fsdecode(path))
+
+    if p.suffix.lower() in IGNORE_EXTENSIONS:
+        return True
+
+    for part in p.parts:
+        if part in IGNORE_DIRS:
+            return True
+
+    if p.name.startswith(".") and p.name not in {".kortix"}:
+        return True
+
+    if "lss.db" in p.name or ".lss" in str(p):
+        return True
+
+    if _is_browser_cache_path(p):
+        return True
+
+    try:
+        from lss_store import _should_exclude_path
+        for watch_path in watch_paths:
+            if _should_exclude_path(str(p), watch_path):
+                return True
+    except Exception:
+        pass
+
+    for pattern in (exclude_patterns or []):
+        if _matches_exclude_pattern(p, pattern):
+            return True
+
+    if max_depth is not None:
+        for watch_path in watch_paths:
+            try:
+                rel = p.relative_to(watch_path)
+                if len(rel.parts) > max_depth:
+                    return True
+            except ValueError:
+                continue
+
+    return False
 
 # Graceful shutdown
 _running = True
@@ -107,18 +182,20 @@ class DebouncedIndexer:
         self._last_index_time = 0.0
         self._indexing = False
 
-    def file_changed(self, path: str):
+    def file_changed(self, path: str | bytes):
         """Called when a file is created or modified."""
+        normalized = os.fsdecode(path)
         with self._lock:
-            self._dirty_files.add(path)
-            self._deleted_files.discard(path)
+            self._dirty_files.add(normalized)
+            self._deleted_files.discard(normalized)
             self._schedule_index()
 
-    def file_deleted(self, path: str):
+    def file_deleted(self, path: str | bytes):
         """Called when a file is deleted."""
+        normalized = os.fsdecode(path)
         with self._lock:
-            self._deleted_files.add(path)
-            self._dirty_files.discard(path)
+            self._deleted_files.add(normalized)
+            self._dirty_files.discard(normalized)
             self._schedule_index()
 
     def _schedule_index(self):
@@ -169,7 +246,7 @@ class DebouncedIndexer:
     def _do_index(self, dirty: set[str], deleted: set[str]):
         """Perform the actual indexing work."""
         try:
-            from lss_store import ensure_indexed, remove_files
+            from lss_store import ensure_indexed, remove_files, _is_text_file
         except ImportError as e:
             print(f"[lss-sync] Failed to import lss_store: {e}", flush=True)
             return
@@ -177,16 +254,31 @@ class DebouncedIndexer:
         t0 = time.time()
         indexed = 0
         removed = 0
+        skipped = 0
         errors = 0
 
         # Index changed files
         for fpath in dirty:
             p = Path(fpath)
+            if _should_ignore_path(
+                str(p), self.watch_paths, self.exclude_patterns, self.max_depth
+            ):
+                skipped += 1
+                continue
             if not p.exists() or not p.is_file():
+                continue
+            if not _is_text_file(p):
+                skipped += 1
                 continue
             try:
                 ensure_indexed(p)
                 indexed += 1
+            except ValueError as e:
+                if "Not a text file" in str(e):
+                    skipped += 1
+                    continue
+                print(f"[lss-sync] Index {fpath} failed: {e}", flush=True)
+                errors += 1
             except Exception as e:
                 print(f"[lss-sync] Index {fpath} failed: {e}", flush=True)
                 errors += 1
@@ -194,15 +286,23 @@ class DebouncedIndexer:
         # Handle deleted files
         if deleted:
             try:
-                remove_files([str(p) for p in deleted])
-                removed = len(deleted)
+                remove_candidates = [
+                    str(p)
+                    for p in deleted
+                    if not _should_ignore_path(
+                        str(p), self.watch_paths, self.exclude_patterns, self.max_depth
+                    )
+                ]
+                if remove_candidates:
+                    remove_files(remove_candidates)
+                    removed = len(remove_candidates)
             except Exception as e:
                 print(f"[lss-sync] Remove failed: {e}", flush=True)
                 errors += 1
 
         elapsed = time.time() - t0
         print(
-            f"[lss-sync] Indexed {indexed}, removed {removed} "
+            f"[lss-sync] Indexed {indexed}, removed {removed}, skipped {skipped} "
             f"({errors} errors) in {elapsed:.1f}s",
             flush=True,
         )
@@ -248,54 +348,14 @@ class LSSSyncHandler(FileSystemEventHandler):
         self.exclude_patterns = exclude_patterns or []
         self.max_depth = max_depth
 
-    def _should_ignore(self, path: str) -> bool:
+    def _should_ignore(self, path: str | bytes) -> bool:
         """Check if this path should be ignored."""
-        p = Path(path)
-
-        # Ignore by extension
-        if p.suffix.lower() in IGNORE_EXTENSIONS:
-            return True
-
-        # Ignore by directory name
-        for part in p.parts:
-            if part in IGNORE_DIRS:
-                return True
-
-        # Ignore hidden files (but not hidden dirs we're explicitly watching)
-        if p.name.startswith(".") and p.name not in {".kortix"}:
-            return True
-
-        # Ignore the lss database itself
-        if "lss.db" in p.name or ".lss" in str(p):
-            return True
-
-        # Check user-supplied exclusion patterns
-        for pattern in self.exclude_patterns:
-            if "*" in pattern:
-                # Glob pattern — fnmatch against filename
-                if fnmatch.fnmatch(p.name, pattern):
-                    return True
-            elif "/" in pattern:
-                # Path substring — match against full path string
-                if pattern in str(p):
-                    return True
-            else:
-                # Plain name — match against any directory component
-                if pattern in p.parts:
-                    return True
-
-        # Check max depth if configured
-        if self.max_depth is not None:
-            # Check depth relative to each watch path
-            for watch_path in self.indexer.watch_paths:
-                try:
-                    rel = p.relative_to(watch_path)
-                    if len(rel.parts) > self.max_depth:
-                        return True
-                except ValueError:
-                    continue
-
-        return False
+        return _should_ignore_path(
+            path,
+            self.indexer.watch_paths,
+            self.exclude_patterns,
+            self.max_depth,
+        )
 
     def on_created(self, event: FileSystemEvent):
         if event.is_directory or self._should_ignore(event.src_path):

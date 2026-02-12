@@ -54,6 +54,25 @@ def test_handler_ignores_excluded_dirs():
         assert handler._should_ignore(f"/project/{d}/foo.py") is True, d
 
 
+def test_handler_ignores_browser_cache_paths():
+    """Browser cache trees should be ignored to prevent watcher spam."""
+    indexer = DebouncedIndexer(["/workspace"], debounce=10)
+    handler = LSSSyncHandler(indexer)
+
+    assert handler._should_ignore(
+        "/workspace/.cache/chromium/Default/Cache/Cache_Data/d63b2f046ee63888_0"
+    ) is True
+    assert handler._should_ignore(
+        "/workspace/.config/chromium/ShaderCache/data_1"
+    ) is True
+    assert handler._should_ignore(
+        "/workspace/.config/chromium/GrShaderCache/data_1"
+    ) is True
+    assert handler._should_ignore(
+        "/workspace/.config/chromium/GraphiteDawnCache/data_1"
+    ) is True
+
+
 def test_handler_ignores_hidden_files():
     """Hidden files (dotfiles) must be ignored."""
     indexer = DebouncedIndexer(["/tmp/watch"], debounce=10)
@@ -195,3 +214,17 @@ def test_debounce_batches_rapid_changes():
     # All 5 files should have been in the dirty set at trigger time
     # (they were cleared by _trigger_index)
     assert len(indexer._dirty_files) == 0  # cleared after trigger
+
+
+def test_do_index_skips_non_text_without_error_log(tmp_path, capsys):
+    """Non-text cache files should be skipped, not counted as errors."""
+    watch_dir = tmp_path / "workspace"
+    cache_file = watch_dir / ".cache" / "chromium" / "Default" / "Cache" / "Cache_Data" / "abc123_0"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_bytes(b"\x00\x01\x02\x03" * 32)
+
+    indexer = DebouncedIndexer([str(watch_dir)], debounce=999)
+    indexer._do_index({str(cache_file)}, set())
+
+    out = capsys.readouterr().out
+    assert "(0 errors)" in out

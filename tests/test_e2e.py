@@ -446,6 +446,34 @@ class TestSyncE2E:
         assert handler._should_ignore("/tmp/test/build/output.js") is True
         assert handler._should_ignore("/tmp/test/readme.md") is False
 
+    def test_sync_ignores_chromium_cache_and_indexes_real_file(self, tmp_path):
+        """Watcher should ignore Chromium cache churn while indexing real files."""
+        from lss_sync import DebouncedIndexer
+
+        watch_dir = tmp_path / "workspace"
+        watch_dir.mkdir()
+
+        real_file = watch_dir / "notes.md"
+        real_file.write_text("Deployment notes for Kubernetes and JWT auth")
+
+        cache_file = watch_dir / ".cache" / "chromium" / "Default" / "Cache" / "Cache_Data" / "d63b2f046ee63888_0"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_bytes(b"\x00\x01\x02\x03" * 64)
+
+        indexer = DebouncedIndexer([str(watch_dir)], debounce=0.1)
+        indexer.file_changed(str(cache_file))
+        indexer.file_changed(str(real_file))
+        time.sleep(1.0)
+
+        import sqlite3
+        con = sqlite3.connect(str(lss_config.LSS_DB))
+        rows = con.execute("SELECT path FROM files WHERE status='active'").fetchall()
+        con.close()
+        paths = [r[0] for r in rows]
+
+        assert any("notes.md" in p for p in paths)
+        assert not any("Cache_Data" in p for p in paths)
+
 
 # ── E2E: Confirmation + progress (no OpenAI needed) ─────────────────────────
 
