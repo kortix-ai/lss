@@ -765,7 +765,7 @@ def _search_single_sentence(q, file_uid, scope_path, cur, cache_con, db_path=Non
     from pathlib import Path
     
     t_all = time.time()
-    version = lss_store.VERSION_KEY
+    version = lss_config.VERSION_KEY
     
     # COMPUTE ONCE: Tokenize and get DF map for all candidate terms
     all_terms = tok(q)
@@ -1172,7 +1172,7 @@ def _search_components(scope_path, query, mode="hybrid"):
     con = lss_store._init_db()
     con.execute("PRAGMA wal_autocheckpoint=0")
     cur = con.cursor()
-    version = lss_store.VERSION_KEY
+    version = lss_config.VERSION_KEY
 
     # ── S1: BM25 ─────────────────────────────────────────────────────────
     all_terms = tok(query)

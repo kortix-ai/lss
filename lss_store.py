@@ -3,7 +3,7 @@ from pathlib import Path
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lss_config import LSS_DIR, LSS_DB, VERSION_KEY
+from lss_config import LSS_DIR, LSS_DB
 import lss_config
 import lss_extract
 
@@ -250,7 +250,7 @@ def _text_hash(text):
 def _get_file_cache_key(path):
     """Fast cache key for file stats"""
     stat = path.stat()
-    return (str(path), stat.st_size, int(stat.st_mtime), VERSION_KEY)
+    return (str(path), stat.st_size, int(stat.st_mtime), lss_config.VERSION_KEY)
 
 def _check_file_cached(file_path):
     """Fast check if file is already indexed - avoids expensive hashing"""
@@ -267,7 +267,7 @@ def _check_file_cached(file_path):
         stat = path.stat()
         row = cur.execute(
             "SELECT file_uid, content_sig FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
-            (str(path), stat.st_size, stat.st_mtime, VERSION_KEY)
+            (str(path), stat.st_size, stat.st_mtime, lss_config.VERSION_KEY)
         ).fetchone()
         if row:
             _cache_put(cache_key, row[0])
@@ -755,7 +755,7 @@ def _do_index(path, con=None):
             (file_uid,)
         ).fetchone()
 
-        if row and row[0] == content_sig and row[1] == VERSION_KEY:
+        if row and row[0] == content_sig and row[1] == lss_config.VERSION_KEY:
             # Content unchanged — update mtime/size in case the inode was
             # touched (e.g. git checkout, cp --preserve) so that the fast
             # path+size+mtime lookup in discover_files keeps matching.
@@ -832,7 +832,7 @@ def _do_index(path, con=None):
             """INSERT OR REPLACE INTO files
                       (file_uid, path, size, mtime, content_sig, version, indexed_at, status)
                       VALUES (?,?,?,?,?,?,?,?)""",
-            (file_uid, str(path), size, mtime, content_sig, VERSION_KEY, time.time(), 'active'),
+            (file_uid, str(path), size, mtime, content_sig, lss_config.VERSION_KEY, time.time(), 'active'),
         )
 
         if own_con:
@@ -1016,7 +1016,7 @@ def _apply_prepared_index(prep: dict, con: sqlite3.Connection):
         (file_uid,),
     ).fetchone()
 
-    if row and row[0] == content_sig and row[1] == VERSION_KEY:
+    if row and row[0] == content_sig and row[1] == lss_config.VERSION_KEY:
         cur.execute(
             "UPDATE files SET path = ?, size = ?, mtime = ? WHERE file_uid = ?",
             (str(path), size, mtime, file_uid),
@@ -1084,7 +1084,7 @@ def _apply_prepared_index(prep: dict, con: sqlite3.Connection):
         """INSERT OR REPLACE INTO files
                       (file_uid, path, size, mtime, content_sig, version, indexed_at, status)
                       VALUES (?,?,?,?,?,?,?,?)""",
-        (file_uid, str(path), size, mtime, content_sig, VERSION_KEY, time.time(), 'active'),
+        (file_uid, str(path), size, mtime, content_sig, lss_config.VERSION_KEY, time.time(), 'active'),
     )
 
     _cache_put(_get_file_cache_key(path), file_uid)
@@ -1159,7 +1159,7 @@ def discover_files(paths_or_dir):
                 rows = con.execute(
                     """SELECT path, size, mtime, file_uid FROM files
                        WHERE status='active' AND version=? AND (path = ? OR path LIKE ?)""",
-                    (VERSION_KEY, base_abs, prefix + "%"),
+                    (lss_config.VERSION_KEY, base_abs, prefix + "%"),
                 ).fetchall()
                 indexed_map = {r[0]: (r[1], r[2], r[3]) for r in rows}
 
@@ -1167,7 +1167,7 @@ def discover_files(paths_or_dir):
             resolved = p.resolve()
             try:
                 stat = resolved.stat()
-                cache_key = (str(resolved), stat.st_size, int(stat.st_mtime), VERSION_KEY)
+                cache_key = (str(resolved), stat.st_size, int(stat.st_mtime), lss_config.VERSION_KEY)
             except OSError:
                 new_paths.append(p)
                 continue
@@ -1189,7 +1189,7 @@ def discover_files(paths_or_dir):
             # Fallback for non-directory inputs
             row = con.execute(
                 "SELECT file_uid FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
-                (str(resolved), stat.st_size, stat.st_mtime, VERSION_KEY)
+                (str(resolved), stat.st_size, stat.st_mtime, lss_config.VERSION_KEY)
             ).fetchone()
             if row:
                 _cache_put(cache_key, row[0])
@@ -1263,7 +1263,7 @@ def ingest_many(paths_or_dir, progress_cb=None):
             try:
                 resolved = fpath.resolve()
                 st = resolved.stat()
-                cache_key = (str(resolved), st.st_size, int(st.st_mtime), VERSION_KEY)
+                cache_key = (str(resolved), st.st_size, int(st.st_mtime), lss_config.VERSION_KEY)
             except OSError:
                 pending.append((fpath, None))
                 continue
@@ -1415,7 +1415,7 @@ def get_file_uid(file_path):
         stat = path.stat()
         row = con.execute(
             "SELECT file_uid FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
-            (str(path), stat.st_size, stat.st_mtime, VERSION_KEY)
+            (str(path), stat.st_size, stat.st_mtime, lss_config.VERSION_KEY)
         ).fetchone()
         if row:
             return row[0]
