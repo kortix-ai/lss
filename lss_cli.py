@@ -1160,8 +1160,8 @@ def cmd_config(args) -> int:
         cfg["embedding_provider"] = value
         lss_config.save_config(cfg)
 
-        # Update runtime state
-        lss_config.EMBEDDING_PROVIDER = value
+        # Update runtime state (keep VERSION_KEY in sync)
+        lss_config.set_embedding_provider(value)
         model, dim = lss_config._provider_model_dim()
 
         print(f"  {_C.dim('provider')}  {_C.bold(value)}")

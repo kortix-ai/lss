@@ -102,8 +102,47 @@ def _provider_model_dim():
 # openai <-> local triggers re-embedding (BM25 index stays intact).
 PREPROC_VER = 2
 CHUNKER_VER = 4
-_model, _dim = _provider_model_dim()
-VERSION_KEY = f"{_model}:{_dim}:p{PREPROC_VER}:c{CHUNKER_VER}"
+
+
+def _compute_version_key(provider: str | None = None) -> str:
+    """Compute the current VERSION_KEY.
+
+    VERSION_KEY is used to partition/cold-invalidate embeddings and to ensure
+    indexing/search stay consistent when preprocessing or chunking changes.
+
+    NOTE: EMBEDDING_PROVIDER can change at runtime (e.g. via `lss config provider`).
+    Use set_embedding_provider()/refresh_version_key() to keep VERSION_KEY in sync.
+    """
+    if provider is None:
+        provider = EMBEDDING_PROVIDER
+
+    if provider == "local":
+        model, dim = LOCAL_MODEL, LOCAL_DIM
+    else:
+        model, dim = OPENAI_MODEL, OPENAI_DIM
+
+    return f"{model}:{dim}:p{PREPROC_VER}:c{CHUNKER_VER}"
+
+
+VERSION_KEY = _compute_version_key()
+
+
+def refresh_version_key() -> str:
+    """Recompute VERSION_KEY from current EMBEDDING_PROVIDER."""
+    global VERSION_KEY
+    VERSION_KEY = _compute_version_key()
+    return VERSION_KEY
+
+
+def set_embedding_provider(provider: str) -> str:
+    """Set EMBEDDING_PROVIDER and keep VERSION_KEY consistent."""
+    global EMBEDDING_PROVIDER, VERSION_KEY
+    provider = (provider or "").strip().lower()
+    if provider not in ("openai", "local"):
+        raise ValueError(f"unknown provider: {provider}")
+    EMBEDDING_PROVIDER = provider
+    VERSION_KEY = _compute_version_key(provider)
+    return VERSION_KEY
 
 # Global debug flag (set by CLI)
 DEBUG = False

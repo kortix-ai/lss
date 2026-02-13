@@ -1,8 +1,9 @@
 import os, time, sqlite3, hashlib, json, re, fnmatch
 from pathlib import Path
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from lss_config import LSS_DIR, LSS_DB, VERSION_KEY
+from lss_config import LSS_DIR, LSS_DB
 import lss_config
 import lss_extract
 
@@ -249,7 +250,7 @@ def _text_hash(text):
 def _get_file_cache_key(path):
     """Fast cache key for file stats"""
     stat = path.stat()
-    return (str(path), stat.st_size, int(stat.st_mtime), VERSION_KEY)
+    return (str(path), stat.st_size, int(stat.st_mtime), lss_config.VERSION_KEY)
 
 def _check_file_cached(file_path):
     """Fast check if file is already indexed - avoids expensive hashing"""
@@ -266,7 +267,7 @@ def _check_file_cached(file_path):
         stat = path.stat()
         row = cur.execute(
             "SELECT file_uid, content_sig FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
-            (str(path), stat.st_size, stat.st_mtime, VERSION_KEY)
+            (str(path), stat.st_size, stat.st_mtime, lss_config.VERSION_KEY)
         ).fetchone()
         if row:
             _cache_put(cache_key, row[0])
@@ -385,10 +386,25 @@ def _extract_text(file_path):
     return lss_extract.extract_text(str(file_path))
 
 def _normalize_text(text):
-    """Normalize text"""
+    """Normalize text for indexing (FTS storage).
+
+    Chunking should run on text that still has newlines so markdown/python
+    boundary detection works. This function is for the stored chunk text.
+    """
     import unicodedata
-    text = unicodedata.normalize('NFKC', text)
+    text = unicodedata.normalize('NFKC', text or "")
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def _normalize_for_chunking(text: str) -> str:
+    """Normalize text for chunk boundary detection.
+
+    Keeps newlines intact (no whitespace collapsing) so _chunk_markdown and
+    _chunk_python can detect headings/definitions.
+    """
+    import unicodedata
+    t = unicodedata.normalize('NFKC', text or "")
+    return t.replace("\r\n", "\n").replace("\r", "\n")
 
 def _span_chunk(text, words_per_span=220, stride=200):
     """Chunk text into overlapping spans of words."""
@@ -589,10 +605,21 @@ def _walk_text_files(base_path, extra_exclude_patterns=None):
             dir_excludes.add(pat)
         file_globs.append(pat)
 
-    # Gitignore state: {dir_path: (file_patterns, dir_patterns)}
+    # Gitignore state as a true stack: [(dir_path, file_patterns, dir_patterns)]
+    # Keep bounded by directory depth for performance.
     gitignore_stack = []
 
+    def _is_subpath(path: str, parent: str) -> bool:
+        if path == parent:
+            return True
+        parent_prefix = parent.rstrip(os.sep) + os.sep
+        return path.startswith(parent_prefix)
+
     for root, dirs, files in os.walk(base):
+        # Maintain stack as we descend/ascend
+        while gitignore_stack and not _is_subpath(root, gitignore_stack[-1][0]):
+            gitignore_stack.pop()
+
         # ── Parse .gitignore in this directory ──
         gitignore_file = os.path.join(root, '.gitignore')
         if os.path.isfile(gitignore_file):
@@ -600,11 +627,10 @@ def _walk_text_files(base_path, extra_exclude_patterns=None):
             gitignore_stack.append((root, gi_files, gi_dirs))
 
         # ── Prune excluded directories ──
-        # Combine hardcoded excludes + gitignore dir patterns
+        # Combine hardcoded excludes + active gitignore dir patterns
         gi_dir_excludes = set()
-        for gi_root, _, gi_dirs_pats in gitignore_stack:
-            # Only apply gitignore dir patterns from ancestor directories
-            if root.startswith(gi_root):
+        if gitignore_stack:
+            for _, _, gi_dirs_pats in gitignore_stack:
                 gi_dir_excludes.update(gi_dirs_pats)
 
         dirs[:] = [
@@ -614,8 +640,8 @@ def _walk_text_files(base_path, extra_exclude_patterns=None):
 
         # ── Collect active gitignore file patterns for this directory ──
         active_gi_file_patterns = []
-        for gi_root, gi_file_pats, _ in gitignore_stack:
-            if root.startswith(gi_root):
+        if gitignore_stack:
+            for _, gi_file_pats, _ in gitignore_stack:
                 active_gi_file_patterns.extend(gi_file_pats)
 
         for name in files:
@@ -729,7 +755,7 @@ def _do_index(path, con=None):
             (file_uid,)
         ).fetchone()
 
-        if row and row[0] == content_sig and row[1] == VERSION_KEY:
+        if row and row[0] == content_sig and row[1] == lss_config.VERSION_KEY:
             # Content unchanged — update mtime/size in case the inode was
             # touched (e.g. git checkout, cp --preserve) so that the fast
             # path+size+mtime lookup in discover_files keeps matching.
@@ -762,8 +788,8 @@ def _do_index(path, con=None):
             cur.execute("DELETE FROM files WHERE file_uid = ?", (old_uid,))
 
         raw_text = _extract_text(path)
-        text = _normalize_text(raw_text)
-        spans = _smart_chunk(text, path.suffix)
+        chunk_input = _normalize_for_chunking(raw_text)
+        spans = _smart_chunk(chunk_input, path.suffix)
 
         existing_hashes = set()
         if row:
@@ -775,6 +801,7 @@ def _do_index(path, con=None):
         new_spans = []
         new_hashes = set()
         for i, (chunk_type, span_text) in enumerate(spans):
+            span_text = _normalize_text(span_text)
             span_id = f"{file_uid}::{i}" if len(spans) > 1 else file_uid
             text_hash_val = _text_hash(span_text)
             new_spans.append((span_id, span_text, file_uid, str(path), text_hash_val))
@@ -785,20 +812,28 @@ def _do_index(path, con=None):
 
         if stale_hashes:
             placeholders = ','.join(['?' for _ in stale_hashes])
-            cur.execute(f"DELETE FROM fts WHERE file_uid = ? AND text_hash IN ({placeholders})",
-                       [file_uid] + list(stale_hashes))
-            cur.execute(f"DELETE FROM embeddings WHERE text_hash IN ({placeholders})",
-                       list(stale_hashes))
+            cur.execute(
+                f"DELETE FROM fts WHERE file_uid = ? AND text_hash IN ({placeholders})",
+                [file_uid] + list(stale_hashes),
+            )
+            cur.execute(
+                f"DELETE FROM embeddings WHERE text_hash IN ({placeholders})",
+                list(stale_hashes),
+            )
 
         fresh_spans = [s for s in new_spans if s[4] in fresh_hashes]
         if fresh_spans:
-            cur.executemany("INSERT INTO fts(id, text, file_uid, file_path, text_hash) VALUES(?,?,?,?,?)",
-                           fresh_spans)
+            cur.executemany(
+                "INSERT INTO fts(id, text, file_uid, file_path, text_hash) VALUES(?,?,?,?,?)",
+                fresh_spans,
+            )
 
-        cur.execute("""INSERT OR REPLACE INTO files
+        cur.execute(
+            """INSERT OR REPLACE INTO files
                       (file_uid, path, size, mtime, content_sig, version, indexed_at, status)
                       VALUES (?,?,?,?,?,?,?,?)""",
-                   (file_uid, str(path), size, mtime, content_sig, VERSION_KEY, time.time(), 'active'))
+            (file_uid, str(path), size, mtime, content_sig, lss_config.VERSION_KEY, time.time(), 'active'),
+        )
 
         if own_con:
             con.commit()
@@ -812,6 +847,248 @@ def _do_index(path, con=None):
     finally:
         if own_con:
             con.close()
+
+
+def _default_index_jobs(total_files: int) -> int:
+    """Worker thread count for preprocessing.
+
+    Auto-enables for large batches; DB writes remain single-threaded.
+    Override with env var LSS_INDEX_JOBS (0 disables).
+    """
+    env = os.environ.get("LSS_INDEX_JOBS")
+    if env is not None:
+        try:
+            v = int(env)
+            return max(0, v)
+        except ValueError:
+            return 0
+
+    if total_files < 500:
+        return 0
+
+    cpu = os.cpu_count() or 4
+    return min(16, max(4, cpu))
+
+
+def _commit_interval(total_files: int) -> int:
+    env = os.environ.get("LSS_COMMIT_INTERVAL")
+    if env is not None:
+        try:
+            v = int(env)
+            return max(1, v)
+        except ValueError:
+            pass
+
+    if total_files >= 2000:
+        return 500
+    if total_files >= 500:
+        return 250
+    return 50
+
+
+_BINARY_EXTRACTOR_EXTS = {'.pdf', '.docx', '.xlsx', '.pptx'}
+
+
+def _extract_text_from_bytes(path: Path, data: bytes) -> str:
+    """Extract text using already-read bytes when possible.
+
+    For binary formats with dedicated parsers, fall back to the existing
+    file-path based extractors.
+    """
+    ext = path.suffix.lower()
+    if ext in _BINARY_EXTRACTOR_EXTS:
+        return _extract_text(path)
+
+    # Decode once for all text formats.
+    def _decode(b: bytes) -> str:
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            for enc in ("latin-1", "cp1252", "iso-8859-1"):
+                try:
+                    return b.decode(enc)
+                except UnicodeDecodeError:
+                    continue
+        return ""
+
+    text = _decode(data)
+    if not text:
+        return ""
+
+    try:
+        if ext == ".json":
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return " ".join(str(v) for v in obj.values() if isinstance(v, (str, int, float)))
+            if isinstance(obj, list):
+                return " ".join(str(item) for item in obj if isinstance(item, (str, int, float)))
+            return str(obj)
+
+        if ext in (".jsonl", ".ndjson"):
+            out = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    if "text" in obj and isinstance(obj.get("text"), str):
+                        out.append(obj["text"])
+                    else:
+                        out.append(" ".join(str(v) for v in obj.values() if isinstance(v, (str, int, float))))
+                elif isinstance(obj, (str, int, float)):
+                    out.append(str(obj))
+            return "\n".join(out)
+
+        if ext in (".csv", ".tsv"):
+            import csv as _csv
+            import io as _io
+            delim = "\t" if ext == ".tsv" else ","
+            reader = _csv.reader(_io.StringIO(text), delimiter=delim)
+            rows = list(reader)
+            if not rows:
+                return ""
+            result = " ".join(rows[0])
+            for row in rows[1: min(100, len(rows))]:
+                result += " " + " ".join(row)
+            return result
+
+        if ext in (".html", ".htm"):
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(text, "html.parser")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                clean = soup.get_text(separator="\n", strip=True)
+                clean = re.sub(r"\n{3,}", "\n\n", clean)
+                return clean.strip()
+            except Exception:
+                return re.sub(r"<[^>]+>", " ", text)
+
+        if ext == ".eml":
+            try:
+                import email as email_mod
+                from email.policy import default as default_policy
+                msg = email_mod.message_from_bytes(data, policy=default_policy)
+                parts = []
+                subject = msg.get("Subject", "")
+                if subject:
+                    parts.append(f"Subject: {subject}")
+                body_text = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            payload = part.get_content()
+                            if isinstance(payload, str):
+                                body_text = payload
+                                break
+                else:
+                    payload = msg.get_content()
+                    if isinstance(payload, str):
+                        body_text = payload
+                if body_text:
+                    parts.append(body_text.strip())
+                return "\n\n".join(parts)
+            except Exception:
+                return text
+
+        return text
+    except Exception:
+        return ""
+
+
+def _apply_prepared_index(prep: dict, con: sqlite3.Connection):
+    """Write a prepared file payload into SQLite (single-writer)."""
+    path = prep["path"]
+    file_uid = prep["file_uid"]
+    size = prep["size"]
+    mtime = prep["mtime"]
+    content_sig = prep["content_sig"]
+    spans = prep["spans"]
+
+    cur = con.cursor()
+
+    row = cur.execute(
+        "SELECT content_sig, version FROM files WHERE file_uid = ?",
+        (file_uid,),
+    ).fetchone()
+
+    if row and row[0] == content_sig and row[1] == lss_config.VERSION_KEY:
+        cur.execute(
+            "UPDATE files SET path = ?, size = ?, mtime = ? WHERE file_uid = ?",
+            (str(path), size, mtime, file_uid),
+        )
+        _cache_put(_get_file_cache_key(path), file_uid)
+        return file_uid
+
+    # Clean up old entries for this path (handles content changes)
+    old_entries = cur.execute(
+        "SELECT file_uid FROM files WHERE path = ? AND file_uid != ?",
+        (str(path), file_uid),
+    ).fetchall()
+    for (old_uid,) in old_entries:
+        old_hashes = cur.execute(
+            "SELECT text_hash FROM fts WHERE file_uid = ?", (old_uid,)
+        ).fetchall()
+        cur.execute("DELETE FROM fts WHERE file_uid = ?", (old_uid,))
+        if old_hashes:
+            placeholders = ','.join(['?' for _ in old_hashes])
+            cur.execute(
+                f"DELETE FROM embeddings WHERE text_hash IN ({placeholders})",
+                [h[0] for h in old_hashes],
+            )
+        cur.execute("DELETE FROM files WHERE file_uid = ?", (old_uid,))
+
+    existing_hashes = set()
+    if row:
+        existing_rows = cur.execute(
+            "SELECT text_hash FROM fts WHERE file_uid = ?", (file_uid,)
+        ).fetchall()
+        existing_hashes = {r[0] for r in existing_rows}
+
+    new_spans = []
+    new_hashes = set()
+    for i, (_chunk_type, span_text) in enumerate(spans):
+        if not span_text:
+            continue
+        span_id = f"{file_uid}::{i}" if len(spans) > 1 else file_uid
+        text_hash_val = _text_hash(span_text)
+        new_spans.append((span_id, span_text, file_uid, str(path), text_hash_val))
+        new_hashes.add(text_hash_val)
+
+    stale_hashes = existing_hashes - new_hashes
+    fresh_hashes = new_hashes - existing_hashes
+
+    if stale_hashes:
+        placeholders = ','.join(['?' for _ in stale_hashes])
+        cur.execute(
+            f"DELETE FROM fts WHERE file_uid = ? AND text_hash IN ({placeholders})",
+            [file_uid] + list(stale_hashes),
+        )
+        cur.execute(
+            f"DELETE FROM embeddings WHERE text_hash IN ({placeholders})",
+            list(stale_hashes),
+        )
+
+    fresh_spans = [s for s in new_spans if s[4] in fresh_hashes]
+    if fresh_spans:
+        cur.executemany(
+            "INSERT INTO fts(id, text, file_uid, file_path, text_hash) VALUES(?,?,?,?,?)",
+            fresh_spans,
+        )
+
+    cur.execute(
+        """INSERT OR REPLACE INTO files
+                      (file_uid, path, size, mtime, content_sig, version, indexed_at, status)
+                      VALUES (?,?,?,?,?,?,?,?)""",
+        (file_uid, str(path), size, mtime, content_sig, lss_config.VERSION_KEY, time.time(), 'active'),
+    )
+
+    _cache_put(_get_file_cache_key(path), file_uid)
+    return file_uid
 
 # ── should_exclude (used by lss_sync.py) ─────────────────────────────────────
 
@@ -866,34 +1143,58 @@ def discover_files(paths_or_dir):
     else:
         all_paths = [Path(p) for p in paths_or_dir]
 
-    # Batch check: single DB connection for all files
+    # Batch check with a single DB connection.
+    # For directory inputs, fetch indexed rows via a single prefix query to
+    # avoid one SELECT per file.
     new_paths = []
     already = 0
     con = _init_db()
     try:
+        indexed_map = None
+        if isinstance(paths_or_dir, (str, Path)):
+            base_path = Path(paths_or_dir)
+            if base_path.is_dir():
+                base_abs = str(base_path.resolve())
+                prefix = base_abs.rstrip(os.sep) + os.sep
+                rows = con.execute(
+                    """SELECT path, size, mtime, file_uid FROM files
+                       WHERE status='active' AND version=? AND (path = ? OR path LIKE ?)""",
+                    (lss_config.VERSION_KEY, base_abs, prefix + "%"),
+                ).fetchall()
+                indexed_map = {r[0]: (r[1], r[2], r[3]) for r in rows}
+
         for p in all_paths:
             resolved = p.resolve()
             try:
-                cache_key = _get_file_cache_key(resolved)
+                stat = resolved.stat()
+                cache_key = (str(resolved), stat.st_size, int(stat.st_mtime), lss_config.VERSION_KEY)
             except OSError:
                 new_paths.append(p)
                 continue
+
             if cache_key in _file_cache:
                 _file_cache.move_to_end(cache_key)
                 already += 1
                 continue
-            try:
-                stat = resolved.stat()
-                row = con.execute(
-                    "SELECT file_uid FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
-                    (str(resolved), stat.st_size, stat.st_mtime, VERSION_KEY)
-                ).fetchone()
-                if row:
-                    _cache_put(cache_key, row[0])
+
+            if indexed_map is not None:
+                hit = indexed_map.get(str(resolved))
+                if hit and hit[0] == stat.st_size and hit[1] == stat.st_mtime:
+                    _cache_put(cache_key, hit[2])
                     already += 1
                 else:
                     new_paths.append(p)
-            except OSError:
+                continue
+
+            # Fallback for non-directory inputs
+            row = con.execute(
+                "SELECT file_uid FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
+                (str(resolved), stat.st_size, stat.st_mtime, lss_config.VERSION_KEY)
+            ).fetchone()
+            if row:
+                _cache_put(cache_key, row[0])
+                already += 1
+            else:
                 new_paths.append(p)
     finally:
         con.close()
@@ -925,54 +1226,131 @@ def ingest_many(paths_or_dir, progress_cb=None):
     if total == 0:
         return []
 
-    # Single connection for the entire batch
     con = _init_db()
     file_uids = []
     batch_count = 0
-    COMMIT_INTERVAL = 50  # commit every N files for WAL performance
+    COMMIT_INTERVAL = _commit_interval(total)
+    jobs = _default_index_jobs(total)
+
+    def _prepare(resolved_path: Path) -> dict:
+        stat = resolved_path.stat()
+        size = stat.st_size
+        if size == 0 or size > MAX_FILE_SIZE:
+            raise ValueError("skip")
+        data = resolved_path.read_bytes()
+        content_sig = hashlib.md5(data).hexdigest()
+        raw_text = _extract_text_from_bytes(resolved_path, data)
+        chunk_input = _normalize_for_chunking(raw_text)
+        spans = _smart_chunk(chunk_input, resolved_path.suffix)
+        spans = [(ct, _normalize_text(st)) for ct, st in spans]
+        return {
+            "path": resolved_path,
+            "size": size,
+            "mtime": stat.st_mtime,
+            "file_uid": _path_uid(resolved_path),
+            "content_sig": content_sig,
+            "spans": spans,
+        }
 
     try:
-        for i, fpath in enumerate(paths):
+        con.execute("BEGIN")
+
+        processed = 0
+        pending = []
+
+        # Main-thread cache fast-path (keeps LRU consistent and avoids wasted work)
+        for fpath in paths:
             try:
-                fpath_resolved = fpath.resolve()
-                # Fast-path: check cache/DB before doing expensive work
-                try:
-                    cache_key = _get_file_cache_key(fpath_resolved)
-                    if cache_key in _file_cache:
-                        _file_cache.move_to_end(cache_key)
-                        file_uids.append(_file_cache[cache_key])
+                resolved = fpath.resolve()
+                st = resolved.stat()
+                cache_key = (str(resolved), st.st_size, int(st.st_mtime), lss_config.VERSION_KEY)
+            except OSError:
+                pending.append((fpath, None))
+                continue
+
+            if cache_key in _file_cache:
+                _file_cache.move_to_end(cache_key)
+                file_uids.append(_file_cache[cache_key])
+                processed += 1
+                if progress_cb:
+                    progress_cb(processed, total, fpath)
+                continue
+
+            pending.append((fpath, resolved))
+
+        if jobs > 0 and pending:
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
+                fut_map = {}
+                for original, resolved in pending:
+                    if resolved is None:
+                        # stat/resolve failed earlier
+                        processed += 1
                         if progress_cb:
-                            progress_cb(i + 1, total, fpath)
+                            progress_cb(processed, total, original)
                         continue
-                except OSError:
-                    pass
+                    fut = ex.submit(_prepare, resolved)
+                    fut_map[fut] = original
 
-                file_uid = _do_index(fpath_resolved, con=con)
-                file_uids.append(file_uid)
-                batch_count += 1
+                for fut in as_completed(fut_map):
+                    original = fut_map[fut]
+                    try:
+                        prep = fut.result()
+                        uid = _apply_prepared_index(prep, con)
+                        if uid:
+                            file_uids.append(uid)
+                            batch_count += 1
 
-                # Periodic commit to keep WAL size manageable
-                if batch_count >= COMMIT_INTERVAL:
-                    con.commit()
-                    batch_count = 0
+                        if batch_count >= COMMIT_INTERVAL:
+                            con.commit()
+                            con.execute("BEGIN")
+                            batch_count = 0
+                    except Exception as e:
+                        if lss_config.DEBUG and str(e) != "skip":
+                            print(f"Failed to index {original}: {e}")
+                    finally:
+                        processed += 1
+                        if progress_cb:
+                            progress_cb(processed, total, original)
+        else:
+            # Sequential fallback (original behavior)
+            for i, fpath in enumerate(paths):
+                try:
+                    fpath_resolved = fpath.resolve()
+                    try:
+                        cache_key = _get_file_cache_key(fpath_resolved)
+                        if cache_key in _file_cache:
+                            _file_cache.move_to_end(cache_key)
+                            file_uids.append(_file_cache[cache_key])
+                            if progress_cb:
+                                progress_cb(i + 1, total, fpath)
+                            continue
+                    except OSError:
+                        pass
 
-            except Exception as e:
-                if lss_config.DEBUG:
-                    print(f"Failed to index {fpath}: {e}")
+                    file_uid = _do_index(fpath_resolved, con=con)
+                    file_uids.append(file_uid)
+                    batch_count += 1
 
-            if progress_cb:
-                progress_cb(i + 1, total, fpath)
+                    if batch_count >= COMMIT_INTERVAL:
+                        con.commit()
+                        con.execute("BEGIN")
+                        batch_count = 0
+                except Exception as e:
+                    if lss_config.DEBUG:
+                        print(f"Failed to index {fpath}: {e}")
 
-        # Final commit
-        if batch_count > 0:
-            con.commit()
+                if progress_cb:
+                    progress_cb(i + 1, total, fpath)
+
+        con.commit()
 
         # Housekeeping — best-effort
-        try:
-            con.execute("INSERT INTO fts(fts) VALUES('optimize')")
-            con.commit()
-        except sqlite3.OperationalError:
-            pass
+        if total >= 200:
+            try:
+                con.execute("INSERT INTO fts(fts) VALUES('optimize')")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass
         try:
             con.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except sqlite3.OperationalError:
@@ -1037,7 +1415,7 @@ def get_file_uid(file_path):
         stat = path.stat()
         row = con.execute(
             "SELECT file_uid FROM files WHERE path = ? AND size = ? AND mtime = ? AND version = ?",
-            (str(path), stat.st_size, stat.st_mtime, VERSION_KEY)
+            (str(path), stat.st_size, stat.st_mtime, lss_config.VERSION_KEY)
         ).fetchone()
         if row:
             return row[0]
