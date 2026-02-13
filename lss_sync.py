@@ -310,7 +310,7 @@ class DebouncedIndexer:
     def force_full_index(self):
         """Force a full index of all watched paths (used on startup)."""
         try:
-            from lss_store import ingest_many, ensure_indexed
+            from lss_store import ingest_many, ensure_indexed, discover_files
         except ImportError as e:
             print(f"[lss-sync] Failed to import lss_store: {e}", flush=True)
             return
@@ -323,8 +323,14 @@ class DebouncedIndexer:
                 continue
             try:
                 if p.is_dir():
-                    ingest_many(p)
-                    print(f"[lss-sync] Indexed directory {path_str}", flush=True)
+                    all_files, new_files, already = discover_files(p)
+                    if new_files:
+                        ingest_many(new_files)
+                    print(
+                        f"[lss-sync] Indexed directory {path_str} "
+                        f"({len(all_files)} files, {len(new_files)} new, {already} already)",
+                        flush=True,
+                    )
                 elif p.is_file():
                     ensure_indexed(p)
                     print(f"[lss-sync] Indexed file {path_str}", flush=True)
