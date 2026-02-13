@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import List, Optional, Union
 
 # Ensure LSS_DIR is set before importing lss_store (reads config at import time)
 if "LSS_DIR" not in os.environ:
@@ -95,10 +96,10 @@ def _matches_exclude_pattern(path: Path, pattern: str) -> bool:
 
 
 def _should_ignore_path(
-    path: str | bytes,
-    watch_paths: list[str],
-    exclude_patterns: list[str] | None = None,
-    max_depth: int | None = None,
+    path: Union[str, bytes],
+    watch_paths: List[str],
+    exclude_patterns: Optional[List[str]] = None,
+    max_depth: Optional[int] = None,
 ) -> bool:
     """Shared path-ignore logic for handler + indexer."""
     p = Path(os.fsdecode(path))
@@ -169,8 +170,13 @@ class DebouncedIndexer:
     picked up within seconds.
     """
 
-    def __init__(self, watch_paths: list[str], debounce: float = DEFAULT_DEBOUNCE,
-                 exclude_patterns: list[str] | None = None, max_depth: int | None = None):
+    def __init__(
+        self,
+        watch_paths: List[str],
+        debounce: float = DEFAULT_DEBOUNCE,
+        exclude_patterns: Optional[List[str]] = None,
+        max_depth: Optional[int] = None,
+    ):
         self.watch_paths = watch_paths
         self.debounce = debounce
         self.exclude_patterns = exclude_patterns or []
@@ -178,11 +184,11 @@ class DebouncedIndexer:
         self._dirty_files: set[str] = set()
         self._deleted_files: set[str] = set()
         self._lock = threading.Lock()
-        self._timer: threading.Timer | None = None
+        self._timer: Optional[threading.Timer] = None
         self._last_index_time = 0.0
         self._indexing = False
 
-    def file_changed(self, path: str | bytes):
+    def file_changed(self, path: Union[str, bytes]):
         """Called when a file is created or modified."""
         normalized = os.fsdecode(path)
         with self._lock:
@@ -190,7 +196,7 @@ class DebouncedIndexer:
             self._deleted_files.discard(normalized)
             self._schedule_index()
 
-    def file_deleted(self, path: str | bytes):
+    def file_deleted(self, path: Union[str, bytes]):
         """Called when a file is deleted."""
         normalized = os.fsdecode(path)
         with self._lock:
@@ -347,14 +353,18 @@ class DebouncedIndexer:
 class LSSSyncHandler(FileSystemEventHandler):
     """Watchdog event handler that feeds file changes to the DebouncedIndexer."""
 
-    def __init__(self, indexer: DebouncedIndexer, exclude_patterns: list[str] | None = None,
-                 max_depth: int | None = None):
+    def __init__(
+        self,
+        indexer: DebouncedIndexer,
+        exclude_patterns: Optional[List[str]] = None,
+        max_depth: Optional[int] = None,
+    ):
         super().__init__()
         self.indexer = indexer
         self.exclude_patterns = exclude_patterns or []
         self.max_depth = max_depth
 
-    def _should_ignore(self, path: str | bytes) -> bool:
+    def _should_ignore(self, path: Union[str, bytes]) -> bool:
         """Check if this path should be ignored."""
         return _should_ignore_path(
             path,

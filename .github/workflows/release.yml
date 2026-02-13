@@ -1,0 +1,65 @@
+name: Create Release Tag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Determine version from pyproject.toml
+        id: ver
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path('pyproject.toml').read_text(encoding='utf-8')
+          m = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', text)
+          if not m:
+            raise SystemExit('Could not find version = "X.Y.Z" in pyproject.toml')
+          version = m.group(1)
+          tag = f"v{version}"
+          print(f"version={version}")
+          print(f"tag={tag}")
+          out_path = os.environ.get("GITHUB_OUTPUT")
+          if not out_path:
+            raise SystemExit("GITHUB_OUTPUT not set")
+          with open(out_path, "a", encoding="utf-8") as f:
+            f.write(f"version={version}\n")
+            f.write(f"tag={tag}\n")
+          PY
+
+      - name: Fail if tag already exists
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag already exists: ${tag}" >&2
+            exit 1
+          fi
+
+      - name: Create and push annotated tag
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+
+      - name: Next steps
+        run: |
+          echo "Created tag ${{ steps.ver.outputs.tag }}."
+          echo "The Publish to PyPI workflow will run automatically on tag push."

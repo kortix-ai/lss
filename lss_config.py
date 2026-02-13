@@ -3,6 +3,7 @@ import copy as _copy
 import json as _json
 import os, sys
 from pathlib import Path
+from typing import Optional
 
 def _is_frozen() -> bool:
     return bool(
@@ -104,7 +105,7 @@ PREPROC_VER = 2
 CHUNKER_VER = 4
 
 
-def _compute_version_key(provider: str | None = None) -> str:
+def _compute_version_key(provider: Optional[str] = None) -> str:
     """Compute the current VERSION_KEY.
 
     VERSION_KEY is used to partition/cold-invalidate embeddings and to ensure

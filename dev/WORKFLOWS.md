@@ -171,12 +171,14 @@ git checkout -b feat/your-thing
 
 ### 2. Bump version
 
-Update the version string in **two** files:
+Update the version string in **one** place:
 
 ```
-lss_cli.py       ->  __version__ = "X.Y.Z"
 pyproject.toml   ->  version = "X.Y.Z"
 ```
+
+`lss` reports the installed package version via package metadata; when running
+from a source checkout it falls back to reading `pyproject.toml`.
 
 Versioning convention:
 - **Patch** (0.5.1 -> 0.5.2): bug fixes, minor tweaks
@@ -195,9 +197,14 @@ Open a PR, get it merged to `main`.
 
 ### 4. Tag and publish to PyPI
 
-The GitHub Actions workflow (`.github/workflows/publish.yml`) triggers on
-version tags. It builds the wheel and publishes to PyPI via trusted publishing
-(no API token needed).
+Recommended: use the GitHub Actions release workflow to create the tag from the
+`pyproject.toml` version (ensures tag and PyPI match):
+
+```bash
+gh workflow run release.yml
+```
+
+Publishing happens automatically on tag push via `.github/workflows/publish.yml`.
 
 ```bash
 git tag v0.5.2
