@@ -34,6 +34,11 @@ def isolated_lss_dir(tmp_path, monkeypatch):
     lss_config.LSS_DB = lss_dir / "lss.db"
     lss_config.CONFIG_FILE = lss_dir / "config.json"
 
+    # Preserve embedding provider globals so tests that call
+    # `config provider` or `set_embedding_provider()` don't leak state.
+    monkeypatch.setattr(lss_config, "EMBEDDING_PROVIDER", lss_config.EMBEDDING_PROVIDER)
+    monkeypatch.setattr(lss_config, "VERSION_KEY", lss_config.VERSION_KEY)
+
     # Clear any cached DB connections / file caches
     import lss_store
 

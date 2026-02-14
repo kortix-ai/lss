@@ -91,7 +91,12 @@ def _get_beir_data(dataset_id: str, tmp_path: Path):
     _setup_beir_env(lss_dir)
 
     print(f"\n  Loading {dataset_id}...")
-    corpus, queries, qrels = load_beir_dataset(dataset_id)
+    try:
+        corpus, queries, qrels = load_beir_dataset(dataset_id)
+    except Exception as e:
+        if "timeout" in str(e).lower() or "connection" in str(e).lower():
+            pytest.skip(f"BEIR dataset download failed (network): {e}")
+        raise
     print(f"  {len(corpus)} docs, {len(queries)} queries, {sum(len(v) for v in qrels.values())} qrels")
 
     corpus_path = tmp_path / "corpus"
