@@ -28,9 +28,36 @@ Management:
 
 import argparse, sys, json, os, sqlite3, time
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-__version__ = "0.5.2"
+import re
+
+def _version_from_metadata() -> Optional[str]:
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            return version("local-semantic-search")
+        except PackageNotFoundError:
+            return None
+    except Exception:
+        return None
+
+
+def _version_from_pyproject() -> Optional[str]:
+    """Best-effort version read when running from source tree."""
+    try:
+        root = Path(__file__).resolve().parent
+        pyproject = root / "pyproject.toml"
+        if not pyproject.exists():
+            return None
+        text = pyproject.read_text(encoding="utf-8")
+        m = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', text)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+__version__ = _version_from_metadata() or _version_from_pyproject() or "0.0.0"
 
 # Set debug BEFORE importing other modules
 import lss_config
@@ -822,7 +849,7 @@ def cmd_version(_args) -> int:
 _PYPI_PACKAGE = "local-semantic-search"
 
 
-def _get_latest_pypi_version() -> str | None:
+def _get_latest_pypi_version() -> Optional[str]:
     """Fetch latest version from PyPI. Returns None on failure."""
     import urllib.request
     try:
@@ -835,7 +862,7 @@ def _get_latest_pypi_version() -> str | None:
         return None
 
 
-def _detect_installer() -> str | None:
+def _detect_installer() -> Optional[str]:
     """Detect how lss was installed: pipx, uv, or pip."""
     import shutil
     import subprocess

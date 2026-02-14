@@ -6,23 +6,67 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  py39_syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Syntax check (Python 3.9)
+        run: python -m compileall -q .
+
   publish:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write  # trusted publishing
+      contents: write
+    needs: [py39_syntax]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build
+        run: pip install build pytest
+
+      - name: Validate tag matches pyproject version
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          from pathlib import Path
+
+          tag = os.environ.get("GITHUB_REF_NAME", "")
+          text = Path("pyproject.toml").read_text(encoding="utf-8")
+          m = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', text)
+          if not m:
+            print("ERROR: could not find [project].version in pyproject.toml", file=sys.stderr)
+            sys.exit(1)
+          version = m.group(1)
+          expected = f"v{version}"
+          if tag != expected:
+            print(f"ERROR: tag '{tag}' does not match pyproject version '{version}' (expected '{expected}')", file=sys.stderr)
+            sys.exit(1)
+          print(f"OK: tag '{tag}' matches pyproject version '{version}'")
+          PY
+
+      - name: Install package (dev + local extras) for tests
+        run: pip install -e ".[dev,local]"
+
+      - name: Run test suite
+        run: pytest
 
       - name: Build package
         run: python -m build
@@ -44,3 +88,10 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
