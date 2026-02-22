@@ -20,7 +20,7 @@ The database lives at `/config/.lss/lss.db`.
 | Source | Path | Content |
 |--------|------|---------|
 | **Desktop files** | `/config/Desktop` | Code, docs, PDFs, DOCX, XLSX, PPTX, HTML, JSON, CSV — all text-like files recursively |
-| **Agent memory** | `/config/workspace/.kortix/` | MEMORY.md, memory/*.md, journal/*.md, knowledge/*.md |
+| **Agent memory** | `/config/workspace/.kortix/` | mem/*.md (observations), journal/*.md, memory/*.md, knowledge/*.md |
 
 Indexed formats: ~80 known extensions (code, markup, config, documents). Unknown extensions are skipped. `.gitignore` patterns are respected.
 
