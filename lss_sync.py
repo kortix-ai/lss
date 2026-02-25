@@ -110,8 +110,11 @@ def _should_ignore_path(
     for part in p.parts:
         if part in IGNORE_DIRS:
             return True
+        # Skip all hidden directories (dotdirs like .config, .vscode-server, etc.)
+        if part.startswith(".") and part not in (".", ".."):
+            return True
 
-    if p.name.startswith(".") and p.name not in {".kortix"}:
+    if p.name.startswith("."):
         return True
 
     if "lss.db" in p.name or ".lss" in str(p):

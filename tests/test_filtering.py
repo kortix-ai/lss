@@ -169,6 +169,54 @@ class TestExtensionlessFiles:
         assert "mystery_binary" not in names
 
 
+# ── Hidden directory pruning ──────────────────────────────────────────────────
+
+
+class TestHiddenDirectoryPruning:
+    def test_dotdirs_are_skipped(self, tmp_path):
+        """Files inside hidden directories (.config, .vscode-server, etc.) are not indexed."""
+        # Create hidden directories with indexable files inside
+        config_dir = tmp_path / ".config" / "chromium"
+        config_dir.mkdir(parents=True)
+        (config_dir / "prefs.json").write_text('{"setting": true}')
+
+        vscode_dir = tmp_path / ".vscode-server" / "extensions"
+        vscode_dir.mkdir(parents=True)
+        (vscode_dir / "ext.js").write_text("module.exports = {}")
+
+        local_dir = tmp_path / ".local" / "share" / "opencode"
+        local_dir.mkdir(parents=True)
+        (local_dir / "auth.json").write_text('{"openai": {}}')
+
+        # Also create a normal file that SHOULD be indexed
+        (tmp_path / "readme.md").write_text("hello")
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "main.py").write_text("print('hello')")
+
+        files = list(_walk_text_files(tmp_path))
+        names = {f.name for f in files}
+
+        # Normal files should be found
+        assert "readme.md" in names
+        assert "main.py" in names
+
+        # Files inside dotdirs should NOT be found
+        assert "prefs.json" not in names
+        assert "ext.js" not in names
+        assert "auth.json" not in names
+
+    def test_dot_and_dotdot_not_skipped(self, tmp_path):
+        """The special directories . and .. should not be treated as hidden."""
+        # This is implicitly tested by the fact that os.walk works at all,
+        # but let's verify our filter doesn't accidentally skip them.
+        (tmp_path / "file.py").write_text("code")
+
+        files = list(_walk_text_files(tmp_path))
+        names = {f.name for f in files}
+        assert "file.py" in names
+
+
 # ── .gitignore parsing ───────────────────────────────────────────────────────
 
 

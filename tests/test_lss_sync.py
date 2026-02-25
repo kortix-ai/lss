@@ -82,6 +82,22 @@ def test_handler_ignores_hidden_files():
     assert handler._should_ignore("/project/.env") is True
 
 
+def test_handler_ignores_hidden_directories():
+    """Files inside hidden directories (.config, .vscode-server, etc.) must be ignored."""
+    indexer = DebouncedIndexer(["/workspace"], debounce=10)
+    handler = LSSSyncHandler(indexer)
+
+    # Dotdirs that should be skipped
+    assert handler._should_ignore("/workspace/.config/chromium/Default/Preferences") is True
+    assert handler._should_ignore("/workspace/.vscode-server/extensions/ext.js") is True
+    assert handler._should_ignore("/workspace/.browser-profile/data.json") is True
+    assert handler._should_ignore("/workspace/.local/share/opencode/auth.json") is True
+
+    # Normal paths should NOT be ignored
+    assert handler._should_ignore("/workspace/project/src/main.py") is False
+    assert handler._should_ignore("/workspace/my-app/package.json") is False
+
+
 def test_handler_allows_normal_text_file():
     """Normal text files should not be ignored."""
     indexer = DebouncedIndexer(["/tmp/watch"], debounce=10)

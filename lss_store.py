@@ -635,7 +635,9 @@ def _walk_text_files(base_path, extra_exclude_patterns=None):
 
         dirs[:] = [
             d for d in dirs
-            if d not in dir_excludes and d not in gi_dir_excludes
+            if d not in dir_excludes
+            and d not in gi_dir_excludes
+            and not (d.startswith(".") and d not in (".", ".."))
         ]
 
         # ── Collect active gitignore file patterns for this directory ──
