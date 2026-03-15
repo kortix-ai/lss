@@ -1,0 +1,28 @@
+name: Update submodule pointer in computer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  update-submodule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout computer
+        uses: actions/checkout@v4
+        with:
+          repository: kortix-ai/computer
+          token: ${{ secrets.SUBMODULE_UPDATE_PAT }}
+          submodules: false
+          fetch-depth: 0
+
+      - name: Update lss pointer to latest main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git submodule update --init --remote packages/lss
+          git add packages/lss
+          git diff --cached --quiet && echo "No change, already up to date." && exit 0
+          git commit -m "chore: auto-update lss to ${{ github.sha }}"
+          git push
